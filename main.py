@@ -13,14 +13,25 @@ Flow per run:
      both are handled.
 
 Files land at:
-    <out>/<active|inactive>/<LastName_FirstName>/<LastName_FirstName>_<assessment_id>.<pdf|csv>
+    <out>/<active|inactive>/[_FLAG_|_IN_PROGRESS_]<LastName_FirstName>_<N>/
+        <LastName_FirstName>_<assessment_id>_<pos>of<N>.<pdf|csv>
 
-If any assessment row's status column is not "Completed", the client's
-folder name is prefixed with "_FLAG_" so it sorts to the top and is
-visibly marked.
+  * <N> is the total assessment count for that client (dynamic,
+    read from the live Care Assessment table).
+  * <pos> is the row's 1-based position in pre-walk order,
+    zero-padded so the folder sorts naturally.
+
+The folder name is prefixed:
+  * "_IN_PROGRESS_" if any row has status "In-Progress" (those rows
+    are SKIPPED — their action icon is a trash can, not an eye).
+  * "_FLAG_"        if any row is non-Completed for some other
+    reason (e.g. Pending, Submitted).
+  * otherwise unprefixed (all rows Completed).
 
 Already-saved files are skipped (resume-on-rerun), based on the
-assessment ID stem matching any existing file in the client folder.
+client+assessment-id prefix matching any existing file in the
+client folder. Old-style filenames are migrated to the new
+"<pos>of<N>" convention on the next run.
 
 Run:
     python main.py                          # both statuses, headed
@@ -612,6 +623,7 @@ def collect_assessment_rows(page: Page) -> list[dict]:
     while True:
         trs = page.locator(ASSESSMENT_ROW_SELECTOR)
         n = trs.count()
+        print(f"        inner page {page_no}: {n} row(s)")
         for i in range(n):
             tr = trs.nth(i)
             rows.append(
@@ -667,6 +679,113 @@ def _try_download_on_page(
         return save_path
     except PlaywrightTimeoutError:
         return None
+
+
+# SSRS ReportViewer (classic ASP.NET) toolbar — the export icon is a
+# floppy-disk image with a small dropdown arrow. The control renders
+# differently across SSRS versions, so we try several candidate
+# selectors. The dropdown opens a menu with options like
+# "Word / Excel / PowerPoint / PDF / TIFF file / MHTML / CSV / XML".
+SSRS_EXPORT_TOGGLE_SELECTORS = (
+    'a[title="Export drop-down menu"]',
+    'a[title*="drop-down" i]',
+    'input[type="image"][title*="Export drop-down" i]',
+    'a[title="Export"]',
+    'a[title*="Export" i]',
+    'input[type="image"][title*="Export" i]',
+    'input[type="image"][title*="Save" i]',
+    'a[title*="Save" i]',
+)
+SSRS_PDF_OPTION_SELECTORS = (
+    'a[title="PDF"]',
+    'a[title="Acrobat (PDF) file"]',
+    'a[title*="PDF" i]',
+    'a:has-text("PDF")',
+    'td:has-text("PDF")',
+)
+
+
+def _try_legacy_ssrs_export_pdf(
+    target_page: Page, save_dir: Path, file_stem: str
+) -> Path | None:
+    """
+    Drive the SSRS ReportViewer toolbar on the legacy
+    ReportSummaryForServicePlan.aspx popup.
+
+    The toolbar has a floppy-disk "Export" icon with a dropdown
+    arrow; clicking the arrow reveals a menu of formats. We pick
+    "PDF" and capture the download.
+
+    Returns the saved Path on success, or None to let the caller
+    fall back to the generic `_try_download_on_page`.
+    """
+    target_page.wait_for_timeout(1_200)  # SSRS toolbar takes a moment
+
+    toggle: Locator | None = None
+    for sel in SSRS_EXPORT_TOGGLE_SELECTORS:
+        loc = target_page.locator(sel).first
+        try:
+            if loc.count() and loc.is_visible():
+                toggle = loc
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if toggle is None:
+        return None
+
+    try:
+        toggle.click()
+    except Exception:  # noqa: BLE001
+        return None
+    target_page.wait_for_timeout(500)  # let the menu render
+
+    pdf_link: Locator | None = None
+    for sel in SSRS_PDF_OPTION_SELECTORS:
+        loc = target_page.locator(sel).first
+        try:
+            if loc.count() and loc.is_visible():
+                pdf_link = loc
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if pdf_link is None:
+        return None
+
+    save_path = save_dir / f"{file_stem}.pdf"
+
+    # SSRS PDF export usually triggers a real download (Content-
+    # Disposition: attachment), but some installs serve it inline
+    # and rely on the browser's "save as" prompt. Try expect_download
+    # first; on timeout, fall back to capturing the response body.
+    try:
+        with target_page.expect_download(timeout=20_000) as dl_info:
+            pdf_link.click()
+        dl = dl_info.value
+        dl.save_as(str(save_path))
+        return save_path
+    except PlaywrightTimeoutError:
+        pass
+
+    # Fallback: snag the PDF response by content-type or `.pdf` URL.
+    try:
+        with target_page.expect_response(
+            lambda r: (
+                "pdf" in (r.headers.get("content-type", "") or "").lower()
+                or r.url.lower().endswith(".pdf")
+                or "format=pdf" in r.url.lower()
+            ),
+            timeout=20_000,
+        ) as resp_info:
+            try:
+                pdf_link.click()
+            except Exception:  # noqa: BLE001
+                pass
+        resp = resp_info.value
+        save_path.write_bytes(resp.body())
+        return save_path
+    except PlaywrightTimeoutError:
+        return None
+
 
 
 def _follow_eye_and_download(
@@ -749,12 +868,17 @@ def _follow_eye_and_download(
         ctx.remove_listener("page", _on_page)
 
     if new_tab is not None:
-        # Flow B: legacy new-tab.
+        # Flow B: legacy new-tab (SSRS ReportViewer popup).
         try:
             new_tab.wait_for_load_state("domcontentloaded", timeout=15_000)
         except PlaywrightTimeoutError:
             pass
-        saved = _try_download_on_page(new_tab, save_dir, file_stem)
+        # Prefer the SSRS-specific path (toolbar icon -> PDF option);
+        # fall back to the generic Download/Export button finder for
+        # non-SSRS legacy popups.
+        saved = _try_legacy_ssrs_export_pdf(new_tab, save_dir, file_stem)
+        if saved is None:
+            saved = _try_download_on_page(new_tab, save_dir, file_stem)
         try:
             new_tab.close()
         except Exception:  # noqa: BLE001
@@ -796,6 +920,22 @@ def _follow_eye_and_download(
                 page.wait_for_selector(
                     ASSESSMENT_ROW_SELECTOR, timeout=10_000
                 )
+                # Wait for the in-place detail panel to fully unmount,
+                # i.e. the Download button count returns to the
+                # baseline we snapshotted before the eye click. If we
+                # don't wait, the NEXT row's "count increased"
+                # detection sees the stale button and clicks the
+                # wrong thing.
+                deadline = 5_000
+                poll = 200
+                elapsed = 0
+                while (
+                    page.locator(DOWNLOAD_BUTTON_SELECTOR).count()
+                    > download_count_before
+                    and elapsed < deadline
+                ):
+                    page.wait_for_timeout(poll)
+                    elapsed += poll
         except Exception:  # noqa: BLE001
             pass
         if saved is not None:
@@ -806,6 +946,97 @@ def _follow_eye_and_download(
 
     print(f"        ?? eye click had no observable effect for {file_stem}")
     return "empty"
+
+
+def _write_status_file(
+    client_folder: Path,
+    client: Client,
+    all_rows: list[dict],
+    position_by_aid: dict[str, int],
+    total: int,
+    pos_width: int,
+) -> None:
+    """
+    Write a self-describing status file to `client_folder` so the
+    user can see completion progress without opening anything.
+
+    Filename:
+        _STATUS_<saved>of<total>_<COMPLETE|MISSING>.txt
+        e.g. "_STATUS_12of21_MISSING.txt"
+             "_STATUS_21of21_COMPLETE.txt"
+
+    The body lists every assessment row with its position, ID,
+    status, and outcome (SAVED / MISSING / SKIP-InProgress).
+
+    Old status files (any matching `_STATUS_*.txt`) are removed
+    before the new one is written so the folder never has stale
+    counts.
+    """
+    # Remove any old status files.
+    for old in client_folder.glob("_STATUS_*.txt"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    # Count actual PDF/CSV files on disk and figure out which
+    # assessment IDs they represent.
+    on_disk = [
+        f for f in client_folder.iterdir()
+        if f.is_file() and f.suffix.lower() in {".pdf", ".csv"}
+    ]
+    name_prefix = name_to_folder(client.name)
+    saved_aids: set[str] = set()
+    for f in on_disk:
+        stem = f.stem
+        for aid in position_by_aid:
+            aid_part = f"{name_prefix}_{safe_filename(aid)}"
+            if stem == aid_part or stem.startswith(aid_part + "_"):
+                saved_aids.add(aid)
+                break
+
+    n_present = len(on_disk)
+    n_inprog = sum(
+        1 for r in all_rows
+        if (r["status"] or "").strip().lower() == "in-progress"
+    )
+    # Complete = every non-In-Progress row is on disk. In-Progress
+    # rows are intentional skips, so they don't count as missing.
+    complete = (n_present + n_inprog) >= total
+    label = "COMPLETE" if complete else "MISSING"
+    fname = f"_STATUS_{n_present}of{total}_{label}.txt"
+    status_path = client_folder / fname
+
+    lines = [
+        f"Client:    {client.name}",
+        f"Status:    {client.status}",
+        f"ClientID:  {client.client_id}",
+        "",
+        f"Total assessments in table:           {total}",
+        f"Files on disk (PDF/CSV):              {n_present}",
+        f"In-Progress (skipped — trash icon):   {n_inprog}",
+        f"Missing (failed or pending):          {max(0, total - n_present - n_inprog)}",
+        "",
+        "Per-row breakdown:",
+    ]
+    for r in all_rows:
+        aid = r["assessment_id"]
+        pos = position_by_aid.get(aid, 0)
+        status = (r["status"] or "").strip()
+        if not aid:
+            state = "NO_ID"
+        elif status.lower() == "in-progress":
+            state = "SKIP (In-Progress)"
+        elif aid in saved_aids:
+            state = "SAVED"
+        else:
+            state = "MISSING"
+        lines.append(
+            f"  {pos:0{pos_width}d}of{total}  aid={aid:<8s}  "
+            f"status={status:<14s}  {state}"
+        )
+    lines.append("")
+    status_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def download_care_assessments_for_client(
@@ -823,22 +1054,53 @@ def download_care_assessments_for_client(
     #     table re-rendering after each download.
     all_rows = collect_assessment_rows(page)
 
+    statuses_lc = [(r["status"] or "").strip().lower() for r in all_rows]
+    has_in_progress = any(s == "in-progress" for s in statuses_lc)
     has_non_completed = any(
-        (r["status"] or "").strip().lower() != "completed" for r in all_rows
+        s and s != "completed" for s in statuses_lc
     )
+    total = len(all_rows)
 
-    # Bucket each client under its status (active/inactive). If any
-    # assessment row is not "Completed", prefix the per-client folder
-    # with "_FLAG_" so the user can spot it at a glance:
-    #     Hospall_Care_Assesments/
-    #       inactive/
-    #         _FLAG_Adams_Doreen/    <- has at least one non-Completed row
-    #         Brown_Charles/         <- all rows are Completed
+    # Bucket each client under its status (active/inactive). Folder
+    # name flag priority (most specific wins so the user can spot
+    # the cause at a glance):
+    #   _IN_PROGRESS_<Name>_<N>  -> at least one In-Progress row
+    #                              (action icon is a TRASH can; row
+    #                              is skipped to avoid deletion).
+    #   _FLAG_<Name>_<N>         -> any other non-Completed row
+    #                              (e.g. Pending, Submitted).
+    #   <Name>_<N>               -> every row is Completed.
+    # <N> is the total assessment count read from the live table,
+    # so the user can tell at a glance whether the folder is
+    # missing any files.
     status_bucket = (client.status or "unknown").strip().lower() or "unknown"
-    folder_label = name_to_folder(client.name)
-    if has_non_completed:
-        folder_label = "_FLAG_" + folder_label
+    base_label = name_to_folder(client.name)
+    if has_in_progress:
+        prefix = "_IN_PROGRESS_"
+    elif has_non_completed:
+        prefix = "_FLAG_"
+    else:
+        prefix = ""
+    folder_label = f"{prefix}{base_label}_{total}" if total else f"{prefix}{base_label}"
     client_folder = out_root / status_bucket / folder_label
+
+    # Migrate an older-naming folder if one exists (any prefix, with
+    # or without the _<N> suffix). This carries already-downloaded
+    # files into the new folder so resume-dedupe still works.
+    if not client_folder.exists():
+        legacy_candidates = [
+            out_root / status_bucket / f"{p}{base_label}{suf}"
+            for p in ("", "_FLAG_", "_IN_PROGRESS_")
+            for suf in (("", f"_{total}") if total else ("",))
+        ]
+        for old in legacy_candidates:
+            if old != client_folder and old.exists():
+                try:
+                    old.rename(client_folder)
+                    print(f"    (migrated folder {old.name!r} -> {client_folder.name!r})")
+                    break
+                except OSError:
+                    pass
     client_folder.mkdir(parents=True, exist_ok=True)
 
     if not all_rows:
@@ -846,10 +1108,25 @@ def download_care_assessments_for_client(
         return (0, 0, 0)
 
     distinct_statuses = sorted({(r["status"] or "").strip() for r in all_rows})
+    flag_tag = (
+        " [_IN_PROGRESS_]"
+        if has_in_progress
+        else (" [_FLAG_]" if has_non_completed else "")
+    )
     print(
         f"    {len(all_rows)} assessment(s) across statuses: "
-        f"{distinct_statuses}{' [_FLAG_]' if has_non_completed else ''}"
+        f"{distinct_statuses}{flag_tag}"
     )
+
+    # Map each assessment id to its 1-based overall position in the
+    # pre-walk order (page 1 row 0 -> 1, ... page N last row -> total).
+    # Files are named "<client>_<aid>_<pos>of<total>.pdf" using a
+    # zero-padded position so the directory sorts naturally.
+    position_by_aid: dict[str, int] = {}
+    for idx, r in enumerate(all_rows, start=1):
+        if r["assessment_id"]:
+            position_by_aid[r["assessment_id"]] = idx
+    pos_width = max(2, len(str(total)))
 
     # Group rows by inner-page number.
     rows_by_page: dict[int, list[dict]] = {}
@@ -861,6 +1138,7 @@ def download_care_assessments_for_client(
     for page_no in sorted(rows_by_page):
         rows_on_page = rows_by_page[page_no]
         n_expected = len(rows_on_page)
+        print(f"    -- inner page {page_no} ({n_expected} row(s)) --")
 
         # Drive by ROW INDEX, re-navigating to this inner page before
         # every row. This is brute-force but robust to whatever the
@@ -873,7 +1151,15 @@ def download_care_assessments_for_client(
                 failed += n_expected - row_idx
                 break
 
+            # The inner table can flicker to 0 rows for a brief
+            # moment after re-rendering; retry-with-wait before
+            # giving up so we don't skip rows for a timing race.
             trs = page.locator(ASSESSMENT_ROW_SELECTOR)
+            wait_total_ms = 0
+            while trs.count() <= row_idx and wait_total_ms < 5_000:
+                page.wait_for_timeout(250)
+                wait_total_ms += 250
+                trs = page.locator(ASSESSMENT_ROW_SELECTOR)
             if trs.count() <= row_idx:
                 print(
                     f"        ?? page {page_no} has only {trs.count()} "
@@ -888,14 +1174,50 @@ def download_care_assessments_for_client(
                 failed += 1
                 continue
 
-            # File name = "<client folder name>_<assessment id>".
-            # Use the un-flagged client folder name so the file stem
-            # stays stable even if a row's status later changes.
-            file_stem = f"{name_to_folder(client.name)}_{safe_filename(aid)}"
+            # SAFETY: skip In-Progress rows. Their action-column icon
+            # is a TRASH can, not an eye, and clicking it deletes the
+            # assessment. Re-read the row's status from the live DOM
+            # in case the cached pre-walk value drifted.
+            row_status = (
+                _row_status(tr) or rows_on_page[row_idx]["status"] or ""
+            ).strip().lower()
+            if row_status == "in-progress":
+                print(
+                    f"        ~ skip {aid}: status=In-Progress "
+                    f"(trash icon, not eye)"
+                )
+                skipped += 1
+                continue
 
-            # Resume / dedupe: skip if any file with this stem exists.
-            existing = list(client_folder.glob(f"{file_stem}.*"))
+            # File stem = "<client>_<aid>_<pos>of<total>". Position
+            # is the row's 1-based ordinal in pre-walk order;
+            # pos_width = max(2, digits-in-total) so a 21-item
+            # client sorts 01..21 alphabetically.
+            pos = position_by_aid.get(aid, 0)
+            aid_part = f"{name_to_folder(client.name)}_{safe_filename(aid)}"
+            if pos:
+                file_stem = f"{aid_part}_{pos:0{pos_width}d}of{total}"
+            else:
+                file_stem = aid_part
+
+            # Resume / dedupe: any file whose name starts with the
+            # client+aid prefix counts as already-downloaded. This
+            # catches both old-style names ("Adams_Doreen_1845.pdf")
+            # and the new "<aid>_<N>of<M>" form. If we find an
+            # old-style file, rename it to the new convention so
+            # the folder ends up consistent.
+            existing = list(client_folder.glob(f"{aid_part}*"))
             if existing:
+                old_file = existing[0]
+                if old_file.stem == aid_part and old_file.stem != file_stem:
+                    try:
+                        new_path = old_file.with_name(
+                            f"{file_stem}{old_file.suffix}"
+                        )
+                        if not new_path.exists():
+                            old_file.rename(new_path)
+                    except OSError:
+                        pass
                 skipped += 1
                 continue
 
@@ -905,6 +1227,14 @@ def download_care_assessments_for_client(
                 failed += 1
                 continue
 
+            # Rows below the fold can swallow `force=True` clicks
+            # because Chromium's hit-testing dispatches at coordinates
+            # outside the viewport. Scroll the row into view first.
+            try:
+                tr.scroll_into_view_if_needed(timeout=3_000)
+            except Exception:  # noqa: BLE001
+                pass
+
             result = _follow_eye_and_download(
                 page, eye, client_folder, file_stem
             )
@@ -912,6 +1242,15 @@ def download_care_assessments_for_client(
                 saved += 1
             else:
                 failed += 1
+
+    # Always rewrite the at-a-glance status file so the filename
+    # itself shows how many files are on disk vs the expected total.
+    try:
+        _write_status_file(
+            client_folder, client, all_rows, position_by_aid, total, pos_width
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"    !! could not write status file: {exc}")
 
     return (saved, skipped, failed)
 
