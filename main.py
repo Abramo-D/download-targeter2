@@ -107,6 +107,11 @@ INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _DEBUG_PAGINATOR = False
 _DEBUG_PAGINATOR_DUMPED = False
 
+# Toggled by --debug-downloads. When True, every failed eye-click /
+# in-place-download attempt writes a screenshot + page-state dump
+# under `debug/<client_id>_<file_stem>_<reason>.{png,txt}`.
+_DEBUG_DOWNLOADS = False
+
 
 @dataclass
 class Client:
@@ -695,6 +700,15 @@ SSRS_EXPORT_TOGGLE_SELECTORS = (
     'input[type="image"][title*="Export" i]',
     'input[type="image"][title*="Save" i]',
     'a[title*="Save" i]',
+    # Classic ReportViewer (no title attr — only the icon src tells
+    # you what the button is). "SaveSplitDown" is the dropdown
+    # arrow; "Save" alone is the default-format button. We prefer
+    # the dropdown arrow when present so the user reliably gets PDF
+    # rather than whatever the default is.
+    'input[type="image"][src*="SaveSplitDown" i]',
+    'input[type="image"][src*="Save" i]',
+    'img[src*="SaveSplitDown" i]',
+    'img[src*="Save" i]',
 )
 SSRS_PDF_OPTION_SELECTORS = (
     'a[title="PDF"]',
@@ -719,25 +733,36 @@ def _try_legacy_ssrs_export_pdf(
     Returns the saved Path on success, or None to let the caller
     fall back to the generic `_try_download_on_page`.
     """
-    target_page.wait_for_timeout(1_200)  # SSRS toolbar takes a moment
-
+    # Cold-start: the first SSRS popup of a session can take a few
+    # seconds for Chrome to finish loading the ReportViewer assets.
+    # Wait for the toolbar to actually be present (any save/export
+    # icon visible), up to 8s, instead of a fixed sleep.
+    deadline_ms = 8_000
+    poll_ms = 250
+    elapsed = 0
     toggle: Locator | None = None
-    for sel in SSRS_EXPORT_TOGGLE_SELECTORS:
-        loc = target_page.locator(sel).first
-        try:
-            if loc.count() and loc.is_visible():
-                toggle = loc
-                break
-        except Exception:  # noqa: BLE001
-            continue
+    while elapsed < deadline_ms and toggle is None:
+        for sel in SSRS_EXPORT_TOGGLE_SELECTORS:
+            loc = target_page.locator(sel).first
+            try:
+                if loc.count() and loc.is_visible():
+                    toggle = loc
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if toggle is None:
+            target_page.wait_for_timeout(poll_ms)
+            elapsed += poll_ms
     if toggle is None:
+        _dump_popup_debug(target_page, file_stem, "ssrs_no_toggle")
         return None
 
     try:
         toggle.click()
     except Exception:  # noqa: BLE001
+        _dump_popup_debug(target_page, file_stem, "ssrs_toggle_click_failed")
         return None
-    target_page.wait_for_timeout(500)  # let the menu render
+    target_page.wait_for_timeout(700)  # let the menu render
 
     pdf_link: Locator | None = None
     for sel in SSRS_PDF_OPTION_SELECTORS:
@@ -749,6 +774,7 @@ def _try_legacy_ssrs_export_pdf(
         except Exception:  # noqa: BLE001
             continue
     if pdf_link is None:
+        _dump_popup_debug(target_page, file_stem, "ssrs_no_pdf_option")
         return None
 
     save_path = save_dir / f"{file_stem}.pdf"
@@ -784,8 +810,111 @@ def _try_legacy_ssrs_export_pdf(
         save_path.write_bytes(resp.body())
         return save_path
     except PlaywrightTimeoutError:
+        _dump_popup_debug(target_page, file_stem, "ssrs_pdf_click_no_download")
         return None
 
+
+def _dump_popup_debug(target_page: Page, file_stem: str, reason: str) -> None:
+    """Snapshot the SSRS popup itself (URL, screenshot, clickables)."""
+    if not _DEBUG_DOWNLOADS:
+        return
+    debug_dir = Path("debug")
+    debug_dir.mkdir(exist_ok=True)
+    safe = safe_filename(f"{file_stem}_{reason}")
+    shot_path = debug_dir / f"{safe}.png"
+    txt_path = debug_dir / f"{safe}.txt"
+    try:
+        target_page.screenshot(path=str(shot_path), full_page=True)
+    except Exception as exc:  # noqa: BLE001
+        shot_path = Path(f"<screenshot failed: {exc}>")
+    try:
+        items = target_page.evaluate(
+            "() => Array.from(document.querySelectorAll("
+            "'a, button, input, img'"
+            ")).filter(e => e.offsetParent !== null).slice(0, 60).map(e => ({"
+            "tag: e.tagName.toLowerCase(),"
+            "type: e.getAttribute('type') || '',"
+            "text: (e.innerText || e.value || '').toString().trim().slice(0, 60),"
+            "title: e.getAttribute('title') || '',"
+            "alt: e.getAttribute('alt') || '',"
+            "src: (e.getAttribute('src') || '').slice(0, 120),"
+            "href: (e.getAttribute('href') || '').slice(0, 120),"
+            "id: e.getAttribute('id') || ''"
+            "}))"
+        )
+    except Exception as exc:  # noqa: BLE001
+        items = [f"<evaluate failed: {exc}>"]
+    lines = [
+        f"reason: {reason}",
+        f"url: {target_page.url}",
+        f"title: {target_page.title()}",
+        "",
+        "Visible elements (top 60):",
+    ]
+    for it in items:
+        lines.append(f"  {it}")
+    txt_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"        [debug-downloads] popup: {shot_path.name}  +  {txt_path.name}")
+
+
+def _dump_download_debug(
+    page: Page,
+    file_stem: str,
+    reason: str,
+    url_before: str,
+    download_count_before: int,
+) -> None:
+    """Write `debug/<file_stem>_<reason>.{png,txt}` to disk."""
+    if not _DEBUG_DOWNLOADS:
+        return
+    debug_dir = Path("debug")
+    debug_dir.mkdir(exist_ok=True)
+    safe = safe_filename(f"{file_stem}_{reason}")
+    shot_path = debug_dir / f"{safe}.png"
+    txt_path = debug_dir / f"{safe}.txt"
+
+    try:
+        page.screenshot(path=str(shot_path), full_page=True)
+    except Exception as exc:  # noqa: BLE001
+        shot_path = Path(f"<screenshot failed: {exc}>")
+
+    info = {
+        "reason": reason,
+        "url_before": url_before,
+        "url_after": page.url,
+        "download_count_before": download_count_before,
+        "download_count_after": (
+            page.locator(DOWNLOAD_BUTTON_SELECTOR).count()
+        ),
+        "tabs_in_context": len(page.context.pages),
+        "row_count_visible": page.locator(ASSESSMENT_ROW_SELECTOR).count(),
+        "back_button_visible_count": page.locator(BACK_BUTTON_SELECTOR).count(),
+    }
+
+    # Capture a list of visible clickables to see what state the
+    # page is in after the click.
+    try:
+        clickables = page.evaluate(
+            "() => Array.from(document.querySelectorAll("
+            "'button, a, [role=\"button\"], span.send-icon, "
+            "span.material-icons, span.material-icons-outlined'"
+            ")).filter(e => e.offsetParent !== null).slice(0, 60).map(e => ({"
+            "tag: e.tagName.toLowerCase(),"
+            "text: (e.innerText || '').trim().slice(0, 60),"
+            "title: e.getAttribute('title') || '',"
+            "aria: e.getAttribute('aria-label') || ''"
+            "}))"
+        )
+    except Exception as exc:  # noqa: BLE001
+        clickables = [f"<evaluate failed: {exc}>"]
+
+    lines = [f"{k}: {v}" for k, v in info.items()]
+    lines.append("")
+    lines.append("Visible clickables (top 60):")
+    for c in clickables:
+        lines.append(f"  {c}")
+    txt_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"        [debug-downloads] {shot_path.name}  +  {txt_path.name}")
 
 
 def _follow_eye_and_download(
@@ -837,6 +966,9 @@ def _follow_eye_and_download(
             eye.click(force=True)
         except Exception as exc:  # noqa: BLE001
             print(f"        ?? eye click raised: {exc}")
+            _dump_download_debug(
+                page, file_stem, "click_raised", url_before, download_count_before
+            )
             return "failed"
 
         # Wait up to ~15s for any of: new tab, URL change, or a
@@ -883,10 +1015,22 @@ def _follow_eye_and_download(
             new_tab.close()
         except Exception:  # noqa: BLE001
             pass
+        # Restore focus to the main page; closing a popup can leave
+        # the main page de-focused which makes the next paginator
+        # navigation fail with "could not navigate to inner page N".
+        try:
+            page.bring_to_front()
+            page.wait_for_timeout(300)
+        except Exception:  # noqa: BLE001
+            pass
         if saved is not None:
             print(f"        + {saved.name} (legacy/new-tab)")
             return "saved"
         print(f"        ?? no download trigger on legacy popup for {file_stem}")
+        _dump_download_debug(
+            page, file_stem, "legacy_popup_no_download",
+            url_before, download_count_before,
+        )
         return "failed"
 
     if same_tab_nav:
@@ -904,6 +1048,10 @@ def _follow_eye_and_download(
             print(f"        + {saved.name} (modern/same-tab)")
             return "saved"
         print(f"        ?? no download trigger on detail page for {file_stem}")
+        _dump_download_debug(
+            page, file_stem, "same_tab_no_download",
+            url_before, download_count_before,
+        )
         return "failed"
 
     if in_place_detail:
@@ -942,9 +1090,16 @@ def _follow_eye_and_download(
             print(f"        + {saved.name} (modern/in-place)")
             return "saved"
         print(f"        ?? no download trigger on in-place detail for {file_stem}")
+        _dump_download_debug(
+            page, file_stem, "in_place_no_download",
+            url_before, download_count_before,
+        )
         return "failed"
 
     print(f"        ?? eye click had no observable effect for {file_stem}")
+    _dump_download_debug(
+        page, file_stem, "empty_no_effect", url_before, download_count_before
+    )
     return "empty"
 
 
@@ -1310,10 +1465,19 @@ def main() -> int:
         help="On the first paginator-not-found, save a screenshot and "
              "dump candidate button/link info to help write a selector.",
     )
+    parser.add_argument(
+        "--debug-downloads",
+        action="store_true",
+        help="On every failed eye-click / in-place-download, save a "
+             "screenshot + page-state dump under debug/ to help "
+             "diagnose why the row didn't save.",
+    )
     args = parser.parse_args()
 
     global _DEBUG_PAGINATOR
     _DEBUG_PAGINATOR = args.debug_paginator
+    global _DEBUG_DOWNLOADS
+    _DEBUG_DOWNLOADS = args.debug_downloads
 
     load_dotenv()
     username = os.getenv("CARESMARTZ_USERNAME")
