@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+care_assessment/
+Hospall_Care_Assesments/
+downloads/
+data/
+debug/
+.playwright/
+.pytest_cache/
+.vscode/
