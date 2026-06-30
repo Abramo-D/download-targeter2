@@ -51,15 +51,15 @@ stopped.
 
 ## Selectors at a glance
 
-| Element | Selector |
-| --- | --- |
-| Client name link | `a[id^="fullname-"]` |
-| Status filter trigger | `[data-testid="cs-select-trigger"]` |
-| Filter option | `.cdk-overlay-pane` text match |
-| Care Assessment tab | `.client-detail-component-nav-link:has-text("Care Assessment")` |
-| Row chevron | `span.material-icons-outlined:has-text("chevron_right")` |
-| Paginator next | `button.mat-mdc-paginator-navigation-next`, `button[aria-label="Next page"]` |
-| Post-navigation download button | any visible `Download` / `Print` / `PDF` / `Export` button or link |
+| Element                         | Selector                                                                     |
+| ------------------------------- | ---------------------------------------------------------------------------- |
+| Client name link                | `a[id^="fullname-"]`                                                         |
+| Status filter trigger           | `[data-testid="cs-select-trigger"]`                                          |
+| Filter option                   | `.cdk-overlay-pane` text match                                               |
+| Care Assessment tab             | `.client-detail-component-nav-link:has-text("Care Assessment")`              |
+| Row chevron                     | `span.material-icons-outlined:has-text("chevron_right")`                     |
+| Paginator next                  | `button.mat-mdc-paginator-navigation-next`, `button[aria-label="Next page"]` |
+| Post-navigation download button | any visible `Download` / `Print` / `PDF` / `Export` button or link           |
 
 ## Gotchas already handled
 
@@ -68,7 +68,7 @@ stopped.
 - **Already-selected guard**: skips the dropdown click if the trigger
   already shows the desired status.
 - **Pagination end detection**: uses both the next-button's
-  `disabled`/`aria-disabled` attribute *and* a row-swap watcher.
+  `disabled`/`aria-disabled` attribute _and_ a row-swap watcher.
 - **Resume**: each PDF's destination path is checked before clicking;
   existing files are silently skipped.
 - **Two click outcomes** for the chevron — direct download vs. navigate
