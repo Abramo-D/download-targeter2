@@ -730,69 +730,72 @@ def _try_legacy_ssrs_export_pdf(
     arrow; clicking the arrow reveals a menu of formats. We pick
     "PDF" and capture the download.
 
+    Landmark-verified flow — each step prints its outcome and
+    aborts cleanly if it can't verify success before moving on:
+
+        L1: locate + click the floppy-disk / Export toggle
+            (frame-aware — SSRS ReportViewer commonly renders
+            the toolbar inside a nested <iframe>).
+        L2: wait for the export menu to open and reveal PDF.
+        L3: click PDF; capture the download or PDF response body.
+
     Returns the saved Path on success, or None to let the caller
     fall back to the generic `_try_download_on_page`.
     """
-    # Cold-start: the first SSRS popup of a session can take a few
-    # seconds for Chrome to finish loading the ReportViewer assets.
-    # Wait for the toolbar to actually be present (any save/export
-    # icon visible), up to 8s, instead of a fixed sleep.
-    deadline_ms = 8_000
-    poll_ms = 250
-    elapsed = 0
-    toggle: Locator | None = None
-    while elapsed < deadline_ms and toggle is None:
-        for sel in SSRS_EXPORT_TOGGLE_SELECTORS:
-            loc = target_page.locator(sel).first
-            try:
-                if loc.count() and loc.is_visible():
-                    toggle = loc
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-        if toggle is None:
-            target_page.wait_for_timeout(poll_ms)
-            elapsed += poll_ms
+    print(f"        [ssrs] popup URL: {target_page.url}")
+
+    # ── Landmark 1: find + click the floppy-disk toggle ────────
+    toggle, toggle_frame = _find_ssrs_toggle(target_page, timeout_ms=15_000)
     if toggle is None:
+        print("        [ssrs] L1 FAIL: floppy-disk toggle not found")
         _dump_popup_debug(target_page, file_stem, "ssrs_no_toggle")
         return None
-
+    frame_label = (
+        "main"
+        if toggle_frame is target_page.main_frame
+        else f"iframe:{toggle_frame.name or toggle_frame.url[:60]!r}"
+    )
+    print(f"        [ssrs] L1 OK: toggle found in {frame_label}")
     try:
         toggle.click()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(f"        [ssrs] L1 FAIL: click raised: {exc}")
         _dump_popup_debug(target_page, file_stem, "ssrs_toggle_click_failed")
         return None
-    target_page.wait_for_timeout(700)  # let the menu render
+    print("        [ssrs] L1 OK: toggle clicked")
 
-    pdf_link: Locator | None = None
-    for sel in SSRS_PDF_OPTION_SELECTORS:
-        loc = target_page.locator(sel).first
-        try:
-            if loc.count() and loc.is_visible():
-                pdf_link = loc
-                break
-        except Exception:  # noqa: BLE001
-            continue
+    # ── Landmark 2: wait for the export menu to open + reveal PDF
+    pdf_link = _wait_for_ssrs_pdf_option(toggle_frame, timeout_ms=8_000)
     if pdf_link is None:
-        _dump_popup_debug(target_page, file_stem, "ssrs_no_pdf_option")
-        return None
+        # Some builds put the menu in a DIFFERENT frame than the
+        # toggle (or in the main frame). Sweep all frames as
+        # fallback before giving up.
+        pdf_link, pdf_frame = _find_ssrs_pdf_option_any_frame(target_page)
+        if pdf_link is None:
+            print("        [ssrs] L2 FAIL: PDF option didn't appear")
+            _dump_popup_debug(target_page, file_stem, "ssrs_no_pdf_option")
+            return None
+        print(
+            f"        [ssrs] L2 OK: PDF option found in fallback "
+            f"frame ({pdf_frame.url[:60]!r})"
+        )
+    else:
+        print("        [ssrs] L2 OK: PDF option visible in export menu")
 
+    # ── Landmark 3: click PDF and capture the download ──────────
     save_path = save_dir / f"{file_stem}.pdf"
-
-    # SSRS PDF export usually triggers a real download (Content-
-    # Disposition: attachment), but some installs serve it inline
-    # and rely on the browser's "save as" prompt. Try expect_download
-    # first; on timeout, fall back to capturing the response body.
     try:
-        with target_page.expect_download(timeout=20_000) as dl_info:
+        with target_page.expect_download(timeout=25_000) as dl_info:
             pdf_link.click()
         dl = dl_info.value
         dl.save_as(str(save_path))
+        print(f"        [ssrs] L3 OK: download captured -> {save_path.name}")
         return save_path
     except PlaywrightTimeoutError:
         pass
 
-    # Fallback: snag the PDF response by content-type or `.pdf` URL.
+    # Fallback: some SSRS installs serve the PDF inline (no
+    # Content-Disposition). Snag the response body directly.
     try:
         with target_page.expect_response(
             lambda r: (
@@ -800,18 +803,90 @@ def _try_legacy_ssrs_export_pdf(
                 or r.url.lower().endswith(".pdf")
                 or "format=pdf" in r.url.lower()
             ),
-            timeout=20_000,
+            timeout=25_000,
         ) as resp_info:
             try:
                 pdf_link.click()
             except Exception:  # noqa: BLE001
                 pass
         resp = resp_info.value
-        save_path.write_bytes(resp.body())
+        body = resp.body()
+        if body[:4] != b"%PDF":
+            print(
+                f"        [ssrs] L3 FAIL: response body isn't a PDF "
+                f"(first bytes: {body[:8]!r})"
+            )
+            _dump_popup_debug(target_page, file_stem, "ssrs_pdf_bad_body")
+            return None
+        save_path.write_bytes(body)
+        print(f"        [ssrs] L3 OK: PDF body captured -> {save_path.name}")
         return save_path
     except PlaywrightTimeoutError:
+        print("        [ssrs] L3 FAIL: PDF click didn't trigger a download")
         _dump_popup_debug(target_page, file_stem, "ssrs_pdf_click_no_download")
         return None
+
+
+def _find_ssrs_toggle(
+    target_page: Page, timeout_ms: int = 15_000
+) -> tuple[Locator | None, object]:
+    """
+    Locate the SSRS Export toggle in ANY frame of the popup page.
+
+    Returns (locator, frame). The frame handle is returned so
+    landmark 2 can search the SAME frame (menu usually appears
+    where the toggle was) before falling back to a page-wide sweep.
+    Returns (None, main_frame) if the toggle never appears.
+    """
+    poll_ms = 250
+    elapsed = 0
+    main_frame = target_page.main_frame
+    while elapsed < timeout_ms:
+        for frame in target_page.frames:
+            for sel in SSRS_EXPORT_TOGGLE_SELECTORS:
+                try:
+                    loc = frame.locator(sel).first
+                    if loc.count() and loc.is_visible():
+                        return loc, frame
+                except Exception:  # noqa: BLE001
+                    continue
+        target_page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+    return None, main_frame
+
+
+def _wait_for_ssrs_pdf_option(
+    frame, timeout_ms: int = 8_000
+) -> Locator | None:
+    """Poll a specific frame for the PDF menu option after toggle click."""
+    poll_ms = 200
+    elapsed = 0
+    while elapsed < timeout_ms:
+        for sel in SSRS_PDF_OPTION_SELECTORS:
+            try:
+                loc = frame.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    return loc
+            except Exception:  # noqa: BLE001
+                continue
+        frame.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+    return None
+
+
+def _find_ssrs_pdf_option_any_frame(
+    target_page: Page,
+) -> tuple[Locator | None, object]:
+    """Last-ditch sweep for the PDF option across every frame."""
+    for frame in target_page.frames:
+        for sel in SSRS_PDF_OPTION_SELECTORS:
+            try:
+                loc = frame.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    return loc, frame
+            except Exception:  # noqa: BLE001
+                continue
+    return None, target_page.main_frame
 
 
 def _dump_popup_debug(target_page: Page, file_stem: str, reason: str) -> None:
@@ -1173,6 +1248,8 @@ def _write_status_file(
         f"Missing (failed or pending):          {max(0, total - n_present - n_inprog)}",
         "",
         "Per-row breakdown:",
+        "  position   assessment_id   care_plan_status   download_result",
+        "  --------   -------------   ----------------   ---------------",
     ]
     for r in all_rows:
         aid = r["assessment_id"]
@@ -1186,9 +1263,9 @@ def _write_status_file(
             state = "SAVED"
         else:
             state = "MISSING"
+        pos_str = f"{pos:0{pos_width}d}of{total}"
         lines.append(
-            f"  {pos:0{pos_width}d}of{total}  aid={aid:<8s}  "
-            f"status={status:<14s}  {state}"
+            f"  {pos_str:<9s}  {aid:<14s}  {status:<17s}  {state}"
         )
     lines.append("")
     status_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1219,15 +1296,16 @@ def download_care_assessments_for_client(
     # Bucket each client under its status (active/inactive). Folder
     # name flag priority (most specific wins so the user can spot
     # the cause at a glance):
-    #   _IN_PROGRESS_<Name>_<N>  -> at least one In-Progress row
-    #                              (action icon is a TRASH can; row
-    #                              is skipped to avoid deletion).
-    #   _FLAG_<Name>_<N>         -> any other non-Completed row
+    #   _IN_PROGRESS_<Name>_<n>of<total>  -> at least one In-Progress
+    #                              row (action icon is a TRASH can;
+    #                              row is skipped to avoid deletion).
+    #   _FLAG_<Name>_<n>of<total>  -> any other non-Completed row
     #                              (e.g. Pending, Submitted).
-    #   <Name>_<N>               -> every row is Completed.
-    # <N> is the total assessment count read from the live table,
-    # so the user can tell at a glance whether the folder is
-    # missing any files.
+    #   <Name>_<n>of<total>        -> every row is Completed.
+    # <n> is the number of PDF/CSV files on disk right now; <total>
+    # is the number of assessments in the live table. So the folder
+    # name itself tells you completeness: "63of63" means done,
+    # "45of63" means 18 still to grab.
     status_bucket = (client.status or "unknown").strip().lower() or "unknown"
     base_label = name_to_folder(client.name)
     if has_in_progress:
@@ -1236,26 +1314,50 @@ def download_care_assessments_for_client(
         prefix = "_FLAG_"
     else:
         prefix = ""
-    folder_label = f"{prefix}{base_label}_{total}" if total else f"{prefix}{base_label}"
-    client_folder = out_root / status_bucket / folder_label
 
-    # Migrate an older-naming folder if one exists (any prefix, with
-    # or without the _<N> suffix). This carries already-downloaded
-    # files into the new folder so resume-dedupe still works.
-    if not client_folder.exists():
-        legacy_candidates = [
-            out_root / status_bucket / f"{p}{base_label}{suf}"
-            for p in ("", "_FLAG_", "_IN_PROGRESS_")
-            for suf in (("", f"_{total}") if total else ("",))
-        ]
-        for old in legacy_candidates:
-            if old != client_folder and old.exists():
-                try:
-                    old.rename(client_folder)
-                    print(f"    (migrated folder {old.name!r} -> {client_folder.name!r})")
-                    break
-                except OSError:
-                    pass
+    parent = out_root / status_bucket
+    parent.mkdir(parents=True, exist_ok=True)
+
+    def _saved_on_disk(folder: Path | None) -> int:
+        if folder is None or not folder.exists():
+            return 0
+        return sum(
+            1 for f in folder.iterdir()
+            if f.is_file() and f.suffix.lower() in {".pdf", ".csv"}
+        )
+
+    def _make_folder_label(saved: int) -> str:
+        if total:
+            return f"{prefix}{base_label}_{saved}of{total}"
+        return f"{prefix}{base_label}"
+
+    # Migrate an older-naming folder if one exists. Covers every
+    # prefix (clean, _FLAG_, _IN_PROGRESS_) AND every legacy suffix
+    # variant (`_21`, `_45of63`, or no suffix at all).
+    base_re = re.compile(
+        r"^(_FLAG_|_IN_PROGRESS_)?"
+        + re.escape(base_label)
+        + r"(_.+)?$"
+    )
+    existing_folder: Path | None = None
+    for p in parent.iterdir():
+        if p.is_dir() and base_re.match(p.name):
+            existing_folder = p
+            break
+    saved_at_start = _saved_on_disk(existing_folder)
+
+    folder_label = _make_folder_label(saved_at_start)
+    client_folder = parent / folder_label
+
+    if existing_folder is not None and existing_folder != client_folder:
+        try:
+            existing_folder.rename(client_folder)
+            print(
+                f"    (migrated folder {existing_folder.name!r} -> "
+                f"{client_folder.name!r})"
+            )
+        except OSError:
+            pass
     client_folder.mkdir(parents=True, exist_ok=True)
 
     if not all_rows:
@@ -1398,6 +1500,24 @@ def download_care_assessments_for_client(
             else:
                 failed += 1
 
+    # If the saved count changed during this run, rename the folder
+    # so its name reflects the new tally (e.g. Blaney_..._45of63 ->
+    # Blaney_..._63of63 once we finish the rest).
+    new_saved = _saved_on_disk(client_folder)
+    if new_saved != saved_at_start:
+        new_label = _make_folder_label(new_saved)
+        new_path = parent / new_label
+        if new_path != client_folder:
+            try:
+                client_folder.rename(new_path)
+                print(
+                    f"    (renamed folder to {new_path.name!r} "
+                    f"[{new_saved}of{total}])"
+                )
+                client_folder = new_path
+            except OSError as exc:
+                print(f"    !! folder rename failed: {exc}")
+
     # Always rewrite the at-a-glance status file so the filename
     # itself shows how many files are on disk vs the expected total.
     try:
@@ -1413,6 +1533,316 @@ def download_care_assessments_for_client(
 # ─── main ──────────────────────────────────────────────────────────────────
 
 
+def _refresh_status_file_at_startup(
+    folder: Path, base_prefix: str, total: int
+) -> bool:
+    """
+    Rewrite the folder's `_STATUS_*.txt` based on current disk
+    state. Parses the previous status file to preserve per-row
+    assessment IDs + care-plan statuses, then re-computes each
+    row's SAVED / MISSING / SKIP outcome against the current PDF
+    inventory. Returns True if a refresh happened.
+
+    Skips the folder if no prior status file exists (there's no
+    row-level data to reconstruct without hitting the network).
+    """
+    status_files = list(folder.glob("_STATUS_*.txt"))
+    if not status_files:
+        return False
+    prev = status_files[0]
+    try:
+        text = prev.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    # Header fields.
+    client_name = "unknown"
+    client_status_bucket = "unknown"
+    client_id = "unknown"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Client:"):
+            client_name = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Status:"):
+            client_status_bucket = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("ClientID:"):
+            client_id = stripped.split(":", 1)[1].strip()
+
+    # Per-row breakdown table.
+    rows: list[dict] = []
+    in_table = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("position") and "assessment_id" in stripped:
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if stripped.startswith("---") or not stripped:
+            if not stripped and rows:
+                break
+            continue
+        # `01of21     1845            Completed          SAVED`
+        parts = stripped.split(None, 3)
+        if len(parts) < 3:
+            continue
+        pos_str = parts[0]
+        aid = parts[1]
+        cp_status = parts[2]
+        m = re.match(r"^(\d+)of(\d+)$", pos_str)
+        if not m:
+            continue
+        rows.append(
+            {
+                "position": int(m.group(1)),
+                "assessment_id": aid,
+                "care_plan_status": cp_status,
+            }
+        )
+    if not rows:
+        return False
+
+    pos_width = max(2, len(str(total)))
+    aid_to_pos = {r["assessment_id"]: r["position"] for r in rows}
+
+    # Rename manually-dropped files whose stem is just the AID (or
+    # AID + something) into the full `<base>_<aid>_<pos>of<total>`
+    # convention so the resume-dedupe glob picks them up. Matches:
+    #   * `1462.pdf`               (bare aid)
+    #   * `1462_manual.pdf`        (aid + suffix)
+    #   * `care_plan_1462.pdf`     (aid embedded, matched by contains
+    #                              a token equal to a known aid)
+    # Files that already start with `<base>_<aid>` are left alone.
+    for f in list(folder.iterdir()):
+        if not f.is_file():
+            continue
+        if f.suffix.lower() not in {".pdf", ".csv"}:
+            continue
+        if f.name.startswith("_STATUS_"):
+            continue
+        stem = f.stem
+        if stem.startswith(base_prefix + "_"):
+            continue  # already conventional
+        matched_aid = None
+        # Prefer exact-token match; also accept "starts with aid_" or
+        # "ends with _aid" so manual naming variants get caught.
+        tokens = re.split(r"[^A-Za-z0-9]+", stem)
+        for aid in aid_to_pos:
+            if aid in tokens or stem == aid or stem.startswith(aid + "_"):
+                matched_aid = aid
+                break
+        if matched_aid is None:
+            continue
+        pos = aid_to_pos[matched_aid]
+        new_stem = (
+            f"{base_prefix}_{matched_aid}_{pos:0{pos_width}d}of{total}"
+        )
+        new_path = f.with_name(f"{new_stem}{f.suffix}")
+        if new_path == f or new_path.exists():
+            continue
+        try:
+            f.rename(new_path)
+            print(
+                f"    [startup] renamed manual file "
+                f"{f.name!r} -> {new_path.name!r}"
+            )
+        except OSError as exc:
+            print(
+                f"    [startup] rename failed for {f.name!r}: {exc}"
+            )
+
+    # Recompute SAVED by matching filenames against `<base>_<aid>*`.
+    on_disk = [
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in {".pdf", ".csv"}
+    ]
+    saved_aids: set[str] = set()
+    for f in on_disk:
+        stem = f.stem
+        for r in rows:
+            aid_part = f"{base_prefix}_{r['assessment_id']}"
+            if stem == aid_part or stem.startswith(aid_part + "_"):
+                saved_aids.add(r["assessment_id"])
+                break
+
+    n_present = len(on_disk)
+    n_inprog = sum(
+        1 for r in rows
+        if r["care_plan_status"].lower() == "in-progress"
+    )
+    complete = (n_present + n_inprog) >= total
+    label = "COMPLETE" if complete else "MISSING"
+
+    # Delete every existing status file, then write the new one.
+    for old in status_files:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    new_path = folder / f"_STATUS_{n_present}of{total}_{label}.txt"
+    lines = [
+        f"Client:    {client_name}",
+        f"Status:    {client_status_bucket}",
+        f"ClientID:  {client_id}",
+        "",
+        f"Total assessments in table:           {total}",
+        f"Files on disk (PDF/CSV):              {n_present}",
+        f"In-Progress (skipped \u2014 trash icon):   {n_inprog}",
+        f"Missing (failed or pending):          "
+        f"{max(0, total - n_present - n_inprog)}",
+        "",
+        "Per-row breakdown:",
+        "  position   assessment_id   care_plan_status   download_result",
+        "  --------   -------------   ----------------   ---------------",
+    ]
+    for r in rows:
+        pos = r["position"]
+        aid = r["assessment_id"]
+        cp = r["care_plan_status"]
+        if cp.lower() == "in-progress":
+            state = "SKIP (In-Progress)"
+        elif aid in saved_aids:
+            state = "SAVED"
+        else:
+            state = "MISSING"
+        pos_str = f"{pos:0{pos_width}d}of{total}"
+        lines.append(f"  {pos_str:<9s}  {aid:<14s}  {cp:<17s}  {state}")
+    lines.append("")
+    new_path.write_text("\n".join(lines), encoding="utf-8")
+    return True
+
+
+def _update_folder_totals_at_startup(out_root: Path) -> None:
+    """
+    Walk `out_root/{active,inactive}` and refresh each client
+    folder's `<saved>of<total>` count in both the folder name AND
+    its `_STATUS_*.txt` breakdown. No network required.
+
+    Folder-name handling:
+      * `Smith_John`               -> skipped (no numeric suffix).
+      * `Smith_John_15`            -> renamed to `Smith_John_NofM`
+                                      using the `15` as the total.
+      * `Smith_John_10of15`        -> re-counted; renamed only if
+                                      the on-disk count changed.
+      * `_FLAG_...` / `_IN_PROGRESS_...` prefixes are preserved
+        as-is (they reflect the last-known status; per-client
+        loop refreshes them when it re-scrapes).
+
+    Status-file handling:
+      * Parses the existing `_STATUS_*.txt` (if any) to keep the
+        per-row assessment IDs / care-plan statuses.
+      * Re-computes each row's SAVED / MISSING / SKIP outcome
+        against the current PDF inventory.
+      * Rewrites the status file with the updated counts and
+        filename.
+    """
+    if not out_root.exists():
+        return
+    renamed = 0
+    status_refreshed = 0
+    scanned = 0
+    for bucket_name in ("active", "inactive"):
+        parent = out_root / bucket_name
+        if not parent.exists():
+            continue
+        for folder in parent.iterdir():
+            if not folder.is_dir():
+                continue
+            scanned += 1
+            name = folder.name
+            m = re.search(r"_(\d+)(?:of(\d+))?$", name)
+            if not m:
+                continue
+            total = int(m.group(2)) if m.group(2) else int(m.group(1))
+            head = name[: m.start()]
+            if head.startswith("_IN_PROGRESS_"):
+                prefix = "_IN_PROGRESS_"
+                base = head[len(prefix):]
+            elif head.startswith("_FLAG_"):
+                prefix = "_FLAG_"
+                base = head[len(prefix):]
+            else:
+                prefix = ""
+                base = head
+            saved = sum(
+                1 for f in folder.iterdir()
+                if f.is_file() and f.suffix.lower() in {".pdf", ".csv"}
+            )
+            new_name = f"{prefix}{base}_{saved}of{total}"
+
+            # Rename the folder if the count in its name is stale.
+            current_folder = folder
+            if new_name != name:
+                try:
+                    folder.rename(parent / new_name)
+                    print(f"    [startup] renamed {name!r} -> {new_name!r}")
+                    renamed += 1
+                    current_folder = parent / new_name
+                except OSError as exc:
+                    print(
+                        f"    [startup] rename failed for {name!r}: {exc}"
+                    )
+
+            # Refresh the status file inside the (possibly renamed)
+            # folder so the per-row breakdown and filename reflect
+            # the current disk state.
+            try:
+                if _refresh_status_file_at_startup(
+                    current_folder, base, total
+                ):
+                    status_refreshed += 1
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"    [startup] status refresh failed for "
+                    f"{current_folder.name!r}: {exc}"
+                )
+    if scanned == 0:
+        print("[*] No existing client folders to refresh.")
+        return
+    parts = []
+    if renamed:
+        parts.append(f"renamed {renamed} folder(s)")
+    if status_refreshed:
+        parts.append(f"refreshed {status_refreshed} status file(s)")
+    if parts:
+        print(
+            f"[*] Startup pass: {', '.join(parts)} "
+            f"(scanned {scanned})."
+        )
+    else:
+        print(
+            f"[*] Scanned {scanned} folder(s); already up to date."
+        )
+
+
+def _prompt_status_choice() -> str:
+    """
+    Ask the user which status bucket to scrape. Returns one of
+    "Inactive" / "Active" / "Both". Falls back to "Inactive" when
+    stdin isn't a TTY (e.g. running under a scheduler).
+    """
+    if not sys.stdin.isatty():
+        return "Inactive"
+    print()
+    print("Which client status do you want to scrape?")
+    print("  1) Inactive  (default)")
+    print("  2) Active")
+    print("  3) Both      (Inactive first, then Active)")
+    while True:
+        try:
+            raw = input("Choice [1]: ").strip().lower()
+        except EOFError:
+            return "Inactive"
+        if raw in ("", "1", "i", "inactive"):
+            return "Inactive"
+        if raw in ("2", "a", "active"):
+            return "Active"
+        if raw in ("3", "b", "both"):
+            return "Both"
+        print("  ! please enter 1, 2, or 3.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Mass-download Care Assessment PDFs from Caresmartz360."
@@ -1420,8 +1850,9 @@ def main() -> int:
     parser.add_argument(
         "--status",
         choices=["Active", "Inactive", "Both"],
-        default="Both",
-        help="Which status filter(s) to walk in the client list.",
+        default=None,
+        help="Which status filter(s) to walk. If omitted, an "
+             "interactive prompt asks you (Inactive default).",
     )
     parser.add_argument(
         "--headless", action="store_true", help="Run without a visible browser."
@@ -1490,6 +1921,19 @@ def main() -> int:
         return 2
 
     args.out.mkdir(parents=True, exist_ok=True)
+
+    # Refresh <saved>of<total> counts on existing client folders
+    # before we touch the network. Purely local; no-op if the tree
+    # is empty.
+    print("[*] Updating existing folder totals...")
+    _update_folder_totals_at_startup(args.out)
+
+    # If --status was omitted, prompt interactively (or fall back
+    # to Inactive when stdin isn't a TTY, e.g. under a scheduler).
+    if args.status is None:
+        args.status = _prompt_status_choice()
+        print(f"[*] Status filter: {args.status}")
+
     # Inactive first when both are requested — that's the bigger
     # bucket and the one the user wants prioritised, so it shouldn't
     # have to wait for the Active walk to finish.
