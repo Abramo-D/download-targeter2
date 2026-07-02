@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import re
 import sys
 import threading
@@ -1275,13 +1276,20 @@ def _try_legacy_ssrs_export_pdf(
         except Exception:  # noqa: BLE001
             pass
 
-    # Close any new tabs the PDF click spawned so they don't
-    # accumulate (SSRS opens the export in a new window on some
-    # builds). Do this AFTER capture so we don't kill an in-flight
-    # download.
-    for extra in [p for p in ctx.pages if p is not target_page]:
+    # Close ONLY the tabs that opened DURING the export (tracked
+    # in `new_tabs` by our `_on_new_page` listener). Do NOT close
+    # every page-that-isn't-target_page — that would close the
+    # original Angular client-detail page too, and the caller's
+    # next paginator navigation would then hit TargetClosedError
+    # ("Locator.count: Target page, context or browser has been
+    # closed"), silently terminating the whole scraper right after
+    # the first successful SSRS PDF landed on disk.
+    for extra in new_tabs:
+        if extra is target_page:
+            continue
         try:
-            extra.close()
+            if not extra.is_closed():
+                extra.close()
         except Exception:  # noqa: BLE001
             pass
 
@@ -2333,6 +2341,53 @@ def _update_folder_totals_at_startup(out_root: Path) -> None:
         )
 
 
+def _install_control_stdout_tee(control: "_ControlWindow") -> None:
+    """
+    Replace `sys.stdout` and `sys.stderr` with tee streams that
+    forward every write to BOTH the original stream (so the
+    terminal log is unchanged) AND `control.enqueue_output(...)`
+    so the text shows up in the control window's Live-output
+    panel.
+
+    Attributes not defined on the tee are proxied to the wrapped
+    stream so callers that inspect `.isatty()`, `.encoding`, or
+    `.fileno()` still get sane answers.
+    """
+    if not hasattr(control, "enqueue_output"):
+        return
+
+    class _Tee:
+        def __init__(self, base):
+            self.base = base
+
+        def write(self, s):
+            try:
+                n = self.base.write(s)
+            except Exception:  # noqa: BLE001
+                n = None
+            try:
+                self.base.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                control.enqueue_output(str(s))
+            except Exception:  # noqa: BLE001
+                pass
+            return n
+
+        def flush(self):
+            try:
+                self.base.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def __getattr__(self, name):
+            return getattr(self.base, name)
+
+    sys.stdout = _Tee(sys.stdout)
+    sys.stderr = _Tee(sys.stderr)
+
+
 class _ControlWindow:
     """
     Always-on-top tkinter window that combines two roles:
@@ -2347,6 +2402,10 @@ class _ControlWindow:
          browser, then refreshes every folder name +
          `_STATUS_*.txt` before exiting.
 
+    Also hosts a read-only "Live output" text panel that mirrors
+    the scraper's stdout/stderr — see `enqueue_output()` and
+    `_install_control_stdout_tee()`.
+
     Runs on a background daemon thread so the scraper's main loop
     keeps running. Falls back to `gui_available = False` if
     tkinter isn't installed or a display can't be opened; in that
@@ -2359,7 +2418,23 @@ class _ControlWindow:
         self.status_choice = initial_status or "Inactive"
         self.gui_available = False
         self._initial_status = initial_status
+        # Thread-safe FIFO of stdout/stderr chunks emitted by the
+        # scraper main thread. Drained onto the Text widget by
+        # `_pump_output_queue` scheduled inside the tkinter thread.
+        # Bounded so a run without a working tkinter consumer
+        # doesn't leak memory (excess writes are silently dropped).
+        self._output_queue: "queue.Queue[str]" = queue.Queue(maxsize=20_000)
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def enqueue_output(self, chunk: str) -> None:
+        """Thread-safe: push a chunk of scraper stdout/stderr text
+        onto the queue for the tkinter thread to display."""
+        if not chunk:
+            return
+        try:
+            self._output_queue.put_nowait(chunk)
+        except queue.Full:
+            pass
 
     def start(self) -> None:
         self._thread.start()
@@ -2400,7 +2475,10 @@ class _ControlWindow:
             root.attributes("-topmost", True)
         except Exception:  # noqa: BLE001
             pass
-        root.geometry("400x260+80+80")
+        # Wide enough for a 720x400 log panel + the picker/close
+        # buttons above it. The running state uses the whole area;
+        # the picker state ignores it.
+        root.geometry("760x520+80+80")
 
         # Widgets built up-front; toggled between "pick status" and
         # "running" states.
@@ -2501,6 +2579,75 @@ class _ControlWindow:
             font=("Segoe UI", 10, "bold"),
         )
         close_btn.pack(pady=10)
+
+        # ── Live scraper output panel ─────────────────────────
+        # A read-only Text widget with a vertical scrollbar,
+        # populated by draining `_output_queue` on the tkinter
+        # thread. `_output_queue` is filled by the scraper's
+        # main thread via `enqueue_output()` (called from a
+        # sys.stdout / sys.stderr tee wired up in main()).
+        output_frame = tk.Frame(running_frame)
+        output_frame.pack(
+            fill="both", expand=True, padx=8, pady=(0, 8)
+        )
+        tk.Label(
+            output_frame,
+            text="Live output",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+
+        scroll = tk.Scrollbar(output_frame)
+        scroll.pack(side="right", fill="y")
+
+        output_text = tk.Text(
+            output_frame,
+            yscrollcommand=scroll.set,
+            wrap="none",
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="#d4d4d4",
+            font=("Consolas", 9),
+            state="disabled",
+            height=20,
+        )
+        output_text.pack(side="left", fill="both", expand=True)
+        scroll.config(command=output_text.yview)
+
+        # Poll the queue and flush any pending chunks into the
+        # widget. Runs on the tkinter thread via `root.after`
+        # scheduling — no cross-thread widget mutation.
+        def _pump_output_queue() -> None:
+            drained: list[str] = []
+            try:
+                while True:
+                    drained.append(self._output_queue.get_nowait())
+            except queue.Empty:
+                pass
+            if drained:
+                blob = "".join(drained)
+                try:
+                    output_text.configure(state="normal")
+                    output_text.insert("end", blob)
+                    output_text.see("end")
+                    # Cap buffer to ~5000 lines so long runs
+                    # don't consume unbounded memory.
+                    end_line = int(
+                        output_text.index("end-1c").split(".")[0]
+                    )
+                    if end_line > 5000:
+                        output_text.delete(
+                            "1.0", f"{end_line - 4000}.0"
+                        )
+                    output_text.configure(state="disabled")
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                root.after(100, _pump_output_queue)
+            except Exception:  # noqa: BLE001
+                pass
+
+        root.after(100, _pump_output_queue)
 
         # Show the appropriate frame at startup.
         if self._initial_status:
@@ -2663,11 +2810,19 @@ def main() -> int:
             def wait_for_start(self, timeout: float | None = None) -> bool:  # noqa: ARG002
                 return True
 
+            def enqueue_output(self, chunk: str) -> None:  # noqa: ARG002
+                pass
+
         control = _NoopControl()  # type: ignore[assignment]
         control.start()
     else:
         control = _ControlWindow(initial_status=args.status)
         control.start()
+        # Tee stdout/stderr so everything the scraper prints ALSO
+        # shows up inside the control window's "Live output" text
+        # panel. The original streams keep working, so the
+        # terminal log is unchanged.
+        _install_control_stdout_tee(control)
 
     if args.status is None:
         # Give tkinter a beat to spin up its window/`gui_available`.
