@@ -115,6 +115,13 @@ _DEBUG_PAGINATOR_DUMPED = False
 # under `debug/<client_id>_<file_stem>_<reason>.{png,txt}`.
 _DEBUG_DOWNLOADS = False
 
+# Toggled by --verbose-rows. When True, `_follow_eye_and_download`
+# prints per-row diagnostic detail (URL before/after the eye click,
+# tabs opened, flow that triggered, timing) even for SUCCESSFUL
+# rows. Useful for diagnosing "why did that row get skipped?" when
+# reading the log after the fact.
+_VERBOSE_ROWS = False
+
 
 @dataclass
 class Client:
@@ -1490,6 +1497,25 @@ def _follow_eye_and_download(
     # changing the URL. Snapshot the count of download-style buttons
     # before the click so we can detect when a new one appears.
     download_count_before = page.locator(DOWNLOAD_BUTTON_SELECTOR).count()
+    tabs_before = len(ctx.pages)
+
+    if _VERBOSE_ROWS:
+        # Read a couple of eye-icon state fields so a "no visible
+        # effect" outcome is diagnosable from the log alone.
+        try:
+            eye_visible = eye.is_visible()
+        except Exception:  # noqa: BLE001
+            eye_visible = "err"
+        try:
+            eye_box = eye.bounding_box()
+        except Exception:  # noqa: BLE001
+            eye_box = None
+        print(
+            f"        [row] pre-click stem={file_stem!r} "
+            f"tabs={tabs_before} dl_btns={download_count_before} "
+            f"eye_visible={eye_visible} eye_box={eye_box} "
+            f"url={url_before[:100]!r}"
+        )
 
     # Drain any orphan tabs left over from previous clicks before
     # arming the listener, so a late-arriving popup from a previous
@@ -1507,6 +1533,7 @@ def _follow_eye_and_download(
             new_page_holder["page"] = np
 
     ctx.on("page", _on_page)
+    click_started_ms = 0
     try:
         try:
             # `force=True` because the eye icon is a tooltip-trigger
@@ -1545,8 +1572,27 @@ def _follow_eye_and_download(
                 break
             page.wait_for_timeout(poll_ms)
             elapsed += poll_ms
+        click_started_ms = elapsed
     finally:
         ctx.remove_listener("page", _on_page)
+
+    if _VERBOSE_ROWS:
+        detected = (
+            "new_tab" if new_tab is not None
+            else ("same_tab_nav" if same_tab_nav
+                  else ("in_place_detail" if in_place_detail else "NONE"))
+        )
+        try:
+            cur_url = page.url
+        except Exception:  # noqa: BLE001
+            cur_url = "<err>"
+        print(
+            f"        [row] post-click flow={detected} "
+            f"wait_ms={click_started_ms} "
+            f"tabs_now={len(ctx.pages)} "
+            f"dl_btns_now={page.locator(DOWNLOAD_BUTTON_SELECTOR).count()} "
+            f"url_now={cur_url[:100]!r}"
+        )
 
     if new_tab is not None:
         # Flow B: legacy new-tab (SSRS ReportViewer popup).
@@ -1656,7 +1702,21 @@ def _follow_eye_and_download(
         )
         return "failed"
 
-    print(f"        ?? eye click had no observable effect for {file_stem}")
+    # No new tab, no URL change, no new download button. Print
+    # WHY as much as we can — the "empty" outcome is the most
+    # common "why did that row get skipped?" question in the run
+    # log. If --debug-downloads is set we ALSO dump a screenshot +
+    # element inventory to `debug/`.
+    try:
+        row_count = page.locator(ASSESSMENT_ROW_SELECTOR).count()
+    except Exception:  # noqa: BLE001
+        row_count = -1
+    print(
+        f"        ?? eye click had no observable effect for "
+        f"{file_stem} "
+        f"(rows={row_count} tabs={len(ctx.pages)} "
+        f"dl_btns={page.locator(DOWNLOAD_BUTTON_SELECTOR).count()})"
+    )
     _dump_download_debug(
         page, file_stem, "empty_no_effect", url_before, download_count_before
     )
@@ -1935,6 +1995,11 @@ def download_care_assessments_for_client(
             # --force-aid gate: skip every row whose assessment_id
             # isn't the one the user asked us to re-download.
             if force_aid and aid != force_aid:
+                if _VERBOSE_ROWS:
+                    print(
+                        f"        - skip aid={aid} pos={row_idx+1}: "
+                        f"--force-aid={force_aid!r} (not this row)"
+                    )
                 skipped += 1
                 continue
 
@@ -1998,8 +2063,17 @@ def download_care_assessments_for_client(
                         )
                         if not new_path.exists():
                             old_file.rename(new_path)
+                            old_file = new_path
                     except OSError:
                         pass
+                # ALWAYS explain a dedupe skip so the log makes it
+                # obvious why a row didn't re-download. Previously
+                # this was silent, which looked like "modern
+                # downloads getting skipped" in the run log.
+                print(
+                    f"        - skip aid={aid} pos={row_idx+1}: "
+                    f"already on disk as {old_file.name!r}"
+                )
                 skipped += 1
                 continue
 
@@ -2236,6 +2310,47 @@ def _refresh_status_file_at_startup(
     lines.append("")
     new_path.write_text("\n".join(lines), encoding="utf-8")
     return True
+
+
+def _client_is_complete(out_root: Path, client: Client) -> tuple[bool, Path | None]:
+    """
+    Return (True, folder) when the client's status-bucket folder
+    already contains a `_STATUS_*_COMPLETE.txt` file, indicating a
+    previous run got every downloadable assessment for this
+    client. Returns (False, None) otherwise (folder missing, no
+    status file, or status file says MISSING).
+
+    The status-file suffix is authoritative — it's rewritten every
+    time the scraper finishes a client, and again at the pre-loop
+    startup pass in `_update_folder_totals_at_startup`, so a
+    COMPLETE marker faithfully reflects on-disk state relative to
+    the assessment count observed the last time we scraped.
+
+    Used to implement `--full-scan` — when the caller passes
+    `full_scan=False` we skip complete clients entirely (no
+    detail-page navigation, no pre-walk) for a fast resume.
+    """
+    status_bucket = (client.status or "unknown").strip().lower() or "unknown"
+    parent = out_root / status_bucket
+    if not parent.exists():
+        return False, None
+    base_label = name_to_folder(client.name)
+    base_re = re.compile(
+        r"^(_FLAG_|_IN_PROGRESS_)?"
+        + re.escape(base_label)
+        + r"(_.+)?$"
+    )
+    for folder in parent.iterdir():
+        if not folder.is_dir():
+            continue
+        if not base_re.match(folder.name):
+            continue
+        # Any `_STATUS_*_COMPLETE.txt` present == complete. Missing
+        # status files or `_MISSING.txt` markers → not complete.
+        for _ in folder.glob("_STATUS_*_COMPLETE.txt"):
+            return True, folder
+        return False, folder
+    return False, None
 
 
 def _update_folder_totals_at_startup(out_root: Path) -> None:
@@ -2759,12 +2874,32 @@ def main() -> int:
              "screenshot + page-state dump under debug/ to help "
              "diagnose why the row didn't save.",
     )
+    parser.add_argument(
+        "--full-scan",
+        action="store_true",
+        help="Process EVERY client, even those whose folder already "
+             "has a _STATUS_*_COMPLETE.txt file. Without this flag, "
+             "complete clients are SKIPPED (fast resume). Use "
+             "--full-scan to re-scan complete clients too (e.g. if "
+             "you suspect new assessments were added to the app).",
+    )
+    parser.add_argument(
+        "--verbose-rows",
+        action="store_true",
+        help="Print per-row diagnostic detail while processing each "
+             "assessment: URL before/after the eye click, tabs "
+             "opened, flow that triggered (new-tab / same-tab / "
+             "in-place), and timing. Useful for diagnosing modern "
+             "downloads that appear to be skipped.",
+    )
     args = parser.parse_args()
 
     global _DEBUG_PAGINATOR
     _DEBUG_PAGINATOR = args.debug_paginator
     global _DEBUG_DOWNLOADS
     _DEBUG_DOWNLOADS = args.debug_downloads
+    global _VERBOSE_ROWS
+    _VERBOSE_ROWS = args.verbose_rows
 
     load_dotenv()
     username = os.getenv("CARESMARTZ_USERNAME")
@@ -2856,6 +2991,7 @@ def main() -> int:
     )
 
     total_clients = total_saved = total_skipped = total_failed = 0
+    total_complete_skipped = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
@@ -2901,6 +3037,29 @@ def main() -> int:
                     )
                     break
                 total_clients += 1
+                # Fast-resume gate: unless --full-scan is set, skip
+                # clients whose folder already carries a
+                # `_STATUS_*_COMPLETE.txt` marker. In --client-id
+                # / --force-aid debug mode we ALWAYS process the
+                # client (that's the whole point of asking for it).
+                if not args.full_scan and not debug_mode:
+                    is_complete, folder = _client_is_complete(
+                        args.out, client
+                    )
+                    if is_complete and folder is not None:
+                        print(
+                            f"[client {total_clients}] {client.status}: "
+                            f"SKIP (complete) {client.name} — "
+                            f"{folder.name}"
+                        )
+                        total_complete_skipped += 1
+                        if args.limit and total_clients >= args.limit:
+                            print(
+                                f"[*] --limit {args.limit} reached, "
+                                "stopping."
+                            )
+                            break
+                        continue
                 print(
                     f"[client {total_clients}] {client.status}: "
                     f"{client.name} ({client.client_id})"
@@ -2932,6 +3091,8 @@ def main() -> int:
 
     print()
     print(f"[+] Clients processed : {total_clients}")
+    print(f"    Complete skipped  : {total_complete_skipped}"
+          f"{' (use --full-scan to re-scan)' if total_complete_skipped else ''}")
     print(f"    PDFs saved        : {total_saved}")
     print(f"    PDFs skipped      : {total_skipped}")
     print(f"    Failures          : {total_failed}")
