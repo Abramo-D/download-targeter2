@@ -737,10 +737,23 @@ def _try_download_on_page(
 # differently across SSRS versions, so we try several candidate
 # selectors. The dropdown opens a menu with options like
 # "Word / Excel / PowerPoint / PDF / TIFF file / MHTML / CSV / XML".
+#
+# Observed on Caresmartz360 (ReportViewer 11.0.3452.0): the anchor
+# looks like:
+#   <a id="ReportViewerSummary_..._ButtonLink"
+#      title="Export drop down menu"   <-- SPACES, not hyphens
+#      href="javascript:void(0)">
+#     <img alt="Export drop down menu" .../>
+#     <img alt="Export drop down menu" src=".../ArrowDo..."/>
+#   </a>
+# So the ORIGINAL "drop-down" selectors never matched — the working
+# fallback is `title*="Export" i]`. Keep both spellings for safety.
 SSRS_EXPORT_TOGGLE_SELECTORS = (
+    'a[title="Export drop down menu"]',
     'a[title="Export drop-down menu"]',
+    'a[title*="drop down" i]',
     'a[title*="drop-down" i]',
-    'input[type="image"][title*="Export drop-down" i]',
+    'input[type="image"][title*="Export drop" i]',
     'a[title="Export"]',
     'a[title*="Export" i]',
     'input[type="image"][title*="Export" i]',
@@ -757,12 +770,104 @@ SSRS_EXPORT_TOGGLE_SELECTORS = (
     'img[src*="Save" i]',
 )
 SSRS_PDF_OPTION_SELECTORS = (
-    'a[title="PDF"]',
+    # Exact-title matches first (most reliable). Classic SSRS 2008+
+    # renders the PDF option as: `<a title="Acrobat (PDF) file">...</a>`.
     'a[title="Acrobat (PDF) file"]',
+    'a[title*="Acrobat" i]',
+    'a[title="PDF"]',
     'a[title*="PDF" i]',
+    # Text-based fallbacks scoped to <a> so we can't accidentally
+    # grab a giant ancestor <td> that ALSO contains the PDF anchor
+    # (e.g. the whole toolbar) — that's what happened when we used
+    # `td:has-text("PDF")` and the click landed on the wrong node.
+    'a:text-is("PDF")',
+    'a:text-is("Acrobat (PDF) file")',
+    'a:has-text("Acrobat (PDF) file")',
     'a:has-text("PDF")',
-    'td:has-text("PDF")',
 )
+
+
+def _ssrs_wait_ready(target_page: Page, timeout_ms: int = 30_000) -> bool:
+    """
+    Poll the SSRS ReportViewer component until it reports it's done
+    loading, so a subsequent `exportReport('PDF')` call doesn't throw
+    `Sys.InvalidOperationException: The report or page is being
+    updated.`
+
+    Readiness signal (in order of preference):
+        1. `rv.get_isLoading()` returns false.
+        2. `rv.get_reportAreaHasReport()` returns true.
+        3. Sys.WebForms.PageRequestManager isn't in an AJAX request
+           (`get_isInAsyncPostBack()` returns false).
+
+    Returns True on ready-signal, False if the timeout elapsed
+    (call-site should still attempt the export — the readiness
+    check is best-effort, not a hard gate).
+    """
+    poll_ms = 250
+    elapsed = 0
+    last_state: dict | None = None
+    while elapsed < timeout_ms:
+        try:
+            state = target_page.evaluate(
+                r"""
+                () => {
+                    let rv = null;
+                    try {
+                        if (typeof Sys !== 'undefined' && Sys.Application
+                            && typeof Sys.Application.getComponents === 'function') {
+                            for (const c of Sys.Application.getComponents()) {
+                                if (c && typeof c.exportReport === 'function') {
+                                    rv = c;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch (e) { /* ignore */ }
+                    const out = {found: !!rv};
+                    if (rv) {
+                        try { out.isLoading = rv.get_isLoading ? rv.get_isLoading() : null; } catch (e) { out.isLoading = 'err'; }
+                        try { out.hasReport = rv.get_reportAreaHasReport ? rv.get_reportAreaHasReport() : null; } catch (e) { out.hasReport = 'err'; }
+                    }
+                    try {
+                        const prm = (typeof Sys !== 'undefined' && Sys.WebForms
+                            && Sys.WebForms.PageRequestManager
+                            && typeof Sys.WebForms.PageRequestManager.getInstance === 'function')
+                            ? Sys.WebForms.PageRequestManager.getInstance() : null;
+                        out.inAsyncPostBack = prm && typeof prm.get_isInAsyncPostBack === 'function' ? prm.get_isInAsyncPostBack() : null;
+                    } catch (e) { out.inAsyncPostBack = 'err'; }
+                    return out;
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            state = None
+
+        last_state = state
+        if state and state.get("found"):
+            is_loading = state.get("isLoading")
+            has_report = state.get("hasReport")
+            in_async = state.get("inAsyncPostBack")
+            # Ready when NOT loading AND NOT in AJAX postback AND
+            # (report content is present OR the flag isn't queryable).
+            if (
+                is_loading is False
+                and in_async is not True
+                and (has_report is True or has_report is None)
+            ):
+                print(
+                    f"        [ssrs] ready: isLoading=False "
+                    f"hasReport={has_report} inAsyncPostBack={in_async}"
+                )
+                return True
+        target_page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+
+    print(
+        f"        [ssrs] ready-wait timed out after {timeout_ms}ms; "
+        f"last state = {last_state}"
+    )
+    return False
 
 
 def _try_legacy_ssrs_export_pdf(
@@ -866,13 +971,55 @@ def _try_legacy_ssrs_export_pdf(
         except Exception as exc:  # noqa: BLE001
             print(f"        [ssrs] L3 direct-fetch failed: {exc}")
 
-    # Attempt 3b: register a CONTEXT-level response listener that
-    # captures any PDF response (Content-Type or URL/query hints),
-    # THEN click the PDF option. Classic SSRS uses `window.open`
-    # to load the PDF into a new tab, so page-level `expect_*`
-    # calls miss it. Context-level catches all pages.
+    # Attempt 3b: register download + response listeners, THEN click
+    # the PDF option. Classic SSRS ReportViewer's `exportReport('PDF')`
+    # sends a request whose response has `Content-Disposition:
+    # attachment`, which Chromium turns into a DOWNLOAD before the
+    # response body is delivered to the renderer. That means
+    # `response.body()` in the response listener is EMPTY / unavailable.
+    # The reliable capture path is `page.on("download", ...)` — see
+    # Playwright docs, downloads are page-level events.
+    #
+    # Three delivery mechanisms are covered:
+    #   (i)  hidden <iframe> appended to target_page → download event
+    #        fires on target_page.
+    #   (ii) window.open(pdf_url) → a NEW tab opens → download event
+    #        fires on that new tab. `ctx.on("page")` wires the
+    #        listener before the new tab has a chance to close.
+    #   (iii) navigation to a PDF URL (content-disposition: inline)
+    #        → the new tab's URL becomes the PDF URL → we fetch it
+    #        directly via `ctx.request.get()`.
     ctx = target_page.context
     captured: list[Path] = []
+    new_tabs: list[Page] = []
+
+    def _save_download(dl) -> None:
+        if captured:
+            return
+        try:
+            suggested = dl.suggested_filename or ""
+            # Honor .csv if that's what the server sent, otherwise pdf.
+            ext = Path(suggested).suffix.lower() or ".pdf"
+            actual = save_dir / f"{file_stem}{ext}"
+            dl.save_as(str(actual))
+            print(
+                f"        [ssrs] L3 download event fired -> "
+                f"{actual.name} (suggested={suggested!r})"
+            )
+            captured.append(actual)
+        except Exception as exc:  # noqa: BLE001
+            print(f"        [ssrs] L3 download save failed: {exc}")
+
+    def _on_new_page(np: Page) -> None:
+        new_tabs.append(np)
+        try:
+            np.on("download", _save_download)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            print(f"        [ssrs] L3 new tab opened: {np.url[:100]!r}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_response(resp) -> None:
         if captured:
@@ -886,34 +1033,252 @@ def _try_legacy_ssrs_export_pdf(
                 and "format=pdf" not in url
             ):
                 return
+            # If Chromium turned this into a download, body() will
+            # raise or return empty. That's fine — the download
+            # handler above will catch it. This listener is a
+            # last-ditch safety net for the rare case where the
+            # server sends `Content-Disposition: inline` and body()
+            # actually works.
             body = resp.body()
-            if not body.startswith(b"%PDF"):
+            if not body or body[:4] != b"%PDF":
                 return
             save_path.write_bytes(body)
+            print(
+                f"        [ssrs] L3 response body captured -> "
+                f"{save_path.name} ({len(body):,} bytes)"
+            )
             captured.append(save_path)
         except Exception:  # noqa: BLE001
             pass
 
+    target_page.on("download", _save_download)
+    ctx.on("page", _on_new_page)
     ctx.on("response", _on_response)
+
+    # Also snoop every request/response on target_page during L3
+    # so we can SEE what URLs SSRS's exportReport is (or isn't)
+    # hitting. Filter to ReportViewerWebControl.axd + PDF-ish URLs
+    # so we don't drown in noise from static-asset traffic.
+    seen_urls: list[str] = []
+
+    def _snoop_request(req) -> None:
+        u = req.url
+        lc = u.lower()
+        if (
+            "reportviewerwebcontrol" in lc
+            or "format=pdf" in lc
+            or lc.endswith(".pdf")
+        ):
+            seen_urls.append(u)
+            print(f"        [ssrs] L3 request: {req.method} {u[:180]}")
+
+    target_page.on("request", _snoop_request)
+
     try:
+        # Attempt 3b.i — DIRECT API call. Bypass the menu-opening
+        # dance entirely by invoking the ReportViewer's client-side
+        # `exportReport('PDF')` method directly. But FIRST wait
+        # until the ReportViewer says it's done loading, otherwise
+        # exportReport throws:
+        #   Sys.InvalidOperationException:
+        #     The report or page is being updated.  Please wait
+        #     for the current action to complete.
+        #
+        # We poll the component's `.get_isLoading()` state (falling
+        # back to `.get_reportAreaHasReport()` if that isn't
+        # available) for up to 30s.
+        _ssrs_wait_ready(target_page, timeout_ms=30_000)
+
+        api_result = None
         try:
-            pdf_link.click()
+            api_result = target_page.evaluate(
+                r"""
+                async () => {
+                    // Locate the ReportViewer client component.
+                    function findRV() {
+                        try {
+                            if (typeof Sys !== 'undefined' && Sys.Application
+                                && typeof Sys.Application.getComponents === 'function') {
+                                for (const c of Sys.Application.getComponents()) {
+                                    if (c && typeof c.exportReport === 'function') {
+                                        return c;
+                                    }
+                                }
+                            }
+                        } catch (e) { /* fall through */ }
+                        if (typeof $find === 'function') {
+                            const withCtl = document.querySelector('[id*="_ctl"]');
+                            if (withCtl) {
+                                const m = withCtl.id.match(/^([A-Za-z0-9]+)_ctl/);
+                                if (m) {
+                                    const r = $find(m[1]);
+                                    if (r && typeof r.exportReport === 'function') return r;
+                                }
+                            }
+                            for (const rid of ['ReportViewerSummary', 'ReportViewer', 'ReportViewerCtrl']) {
+                                const r = $find(rid);
+                                if (r && typeof r.exportReport === 'function') return r;
+                            }
+                        }
+                        return null;
+                    }
+                    const rv = findRV();
+                    if (!rv) return {ok: false, reason: 'no-reportviewer'};
+                    const rvId = (typeof rv.get_id === 'function' ? rv.get_id() : (rv.id || '<?>'));
+
+                    // Retry loop: exportReport throws
+                    //   "The report or page is being updated"
+                    // until the ReportViewer's internal state is
+                    // ready. Poll for up to 45s at 500ms intervals.
+                    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                    const deadline = Date.now() + 45_000;
+                    let lastErr = null;
+                    let attempts = 0;
+                    while (Date.now() < deadline) {
+                        attempts++;
+                        try {
+                            rv.exportReport('PDF');
+                            return {ok: true, method: 'component', reportId: rvId, attempts};
+                        } catch (e) {
+                            lastErr = (e && e.message) || String(e);
+                            // Only retry on the "being updated" error — other
+                            // errors are fatal.
+                            if (!/being updated|current action/i.test(lastErr)) {
+                                return {ok: false, reason: 'exportReport-threw', message: lastErr, reportId: rvId, attempts};
+                            }
+                        }
+                        await sleep(500);
+                    }
+                    return {ok: false, reason: 'timeout', message: lastErr, reportId: rvId, attempts};
+                }
+                """
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"        [ssrs] L3 click raised: {exc}")
-        deadline_ms = 25_000
-        poll_ms = 200
+            api_result = {"ok": False, "reason": f"eval-raised: {exc}"}
+
+        if api_result and api_result.get("ok"):
+            print(
+                f"        [ssrs] L3 direct API: "
+                f"exportReport('PDF') on {api_result.get('reportId')!r} "
+                f"(attempts={api_result.get('attempts')})"
+            )
+        else:
+            print(f"        [ssrs] L3 direct API skipped: {api_result}")
+
+        # Diagnostic — log what the pdf_link is pointing to before
+        # any click, so if the click also fails we can see what was
+        # actually attempted.
+        try:
+            info = pdf_link.evaluate(
+                "(el) => ({tag: el.tagName.toLowerCase(), "
+                "text: (el.innerText || el.textContent || '').trim().slice(0, 60), "
+                "href: el.getAttribute('href') || '', "
+                "onclick: (el.getAttribute('onclick') || '').slice(0, 120), "
+                "title: el.getAttribute('title') || ''})"
+            )
+            print(f"        [ssrs] L3 pdf_link: {info}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"        [ssrs] L3 pdf_link introspection failed: {exc}")
+
+        # If the direct API didn't take, DOM-click the anchor
+        # (bypasses Playwright's mouse move so the menu doesn't
+        # close before the click).
+        if not (api_result and api_result.get("ok")):
+            try:
+                pdf_link.evaluate("(el) => el.click()")
+                print("        [ssrs] L3 fallback: DOM click on PDF anchor dispatched")
+            except Exception as exc:  # noqa: BLE001
+                print(f"        [ssrs] L3 DOM click raised: {exc}")
+
+        deadline_ms = 30_000
+        poll_ms = 250
         elapsed = 0
         while elapsed < deadline_ms and not captured:
             target_page.wait_for_timeout(poll_ms)
             elapsed += poll_ms
+
+            # If we saw a PDF-looking request URL fly by but no
+            # download event fired, fetch it directly via the
+            # context request client (session cookies come along).
+            for candidate_url in list(seen_urls):
+                if captured:
+                    break
+                lc = candidate_url.lower()
+                if not (
+                    "format=pdf" in lc
+                    or lc.endswith(".pdf")
+                    or "reportviewerwebcontrol" in lc
+                ):
+                    continue
+                try:
+                    response = ctx.request.get(candidate_url)
+                    if response.ok:
+                        body = response.body()
+                        if body[:4] == b"%PDF":
+                            save_path.write_bytes(body)
+                            captured.append(save_path)
+                            print(
+                                f"        [ssrs] L3 refetched URL -> "
+                                f"{save_path.name} ({len(body):,} bytes)"
+                            )
+                            break
+                except Exception as exc:  # noqa: BLE001
+                    print(f"        [ssrs] L3 refetch raised: {exc}")
+
+            # Poll new-tab URLs: if one navigated to a PDF-looking
+            # URL and no download event fired, fetch it directly
+            # via the context's request client (session cookies
+            # come along). Covers the inline-render case.
+            for np in list(new_tabs):
+                if captured:
+                    break
+                try:
+                    nurl = np.url or ""
+                except Exception:  # noqa: BLE001
+                    continue
+                lc = nurl.lower()
+                if not (
+                    "format=pdf" in lc
+                    or lc.endswith(".pdf")
+                    or "reportviewerwebcontrol" in lc
+                ):
+                    continue
+                try:
+                    response = ctx.request.get(nurl)
+                    if response.ok:
+                        body = response.body()
+                        if body[:4] == b"%PDF":
+                            save_path.write_bytes(body)
+                            captured.append(save_path)
+                            print(
+                                f"        [ssrs] L3 new-tab fetch -> "
+                                f"{save_path.name} ({len(body):,} bytes)"
+                            )
+                            break
+                except Exception as exc:  # noqa: BLE001
+                    print(f"        [ssrs] L3 new-tab fetch raised: {exc}")
     finally:
+        try:
+            target_page.remove_listener("download", _save_download)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            target_page.remove_listener("request", _snoop_request)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ctx.remove_listener("page", _on_new_page)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             ctx.remove_listener("response", _on_response)
         except Exception:  # noqa: BLE001
             pass
 
-    # Close any new tabs the PDF click spawned (SSRS opens the
-    # export in a new window) so they don't accumulate.
+    # Close any new tabs the PDF click spawned so they don't
+    # accumulate (SSRS opens the export in a new window on some
+    # builds). Do this AFTER capture so we don't kill an in-flight
+    # download.
     for extra in [p for p in ctx.pages if p is not target_page]:
         try:
             extra.close()
@@ -921,10 +1286,6 @@ def _try_legacy_ssrs_export_pdf(
             pass
 
     if captured:
-        print(
-            f"        [ssrs] L3 OK: response captured -> "
-            f"{captured[0].name}"
-        )
         return captured[0]
 
     print("        [ssrs] L3 FAIL: PDF click didn't produce a PDF response")
@@ -1185,6 +1546,17 @@ def _follow_eye_and_download(
             new_tab.wait_for_load_state("domcontentloaded", timeout=15_000)
         except PlaywrightTimeoutError:
             pass
+        # SSRS ReportViewer runs a bunch of AJAX renders AFTER
+        # DOMContentLoaded — the report content, page-count widget,
+        # toolbar images, etc. Wait for networkidle so the report
+        # is fully rendered before we invoke exportReport('PDF')
+        # (otherwise the ReportViewer throws "The report or page
+        # is being updated. Please wait for the current action to
+        # complete."). networkidle == ~500ms of no network requests.
+        try:
+            new_tab.wait_for_load_state("networkidle", timeout=30_000)
+        except PlaywrightTimeoutError:
+            pass
         # Prefer the SSRS-specific path (toolbar icon -> PDF option);
         # fall back to the generic Download/Export button finder for
         # non-SSRS legacy popups.
@@ -1381,8 +1753,16 @@ def download_care_assessments_for_client(
     client: Client,
     out_root: Path,
     shutdown_event: threading.Event | None = None,
+    force_aid: str = "",
 ) -> tuple[int, int, int]:
-    """Returns (saved, skipped, failed) for this client."""
+    """Returns (saved, skipped, failed) for this client.
+
+    When `force_aid` is non-empty, only rows whose assessment_id
+    equals that value are processed, and the resume-dedupe check is
+    bypassed so an already-saved file gets re-downloaded. Any
+    existing PDF/CSV matching that assessment_id is deleted first
+    so the SSRS flow re-runs cleanly.
+    """
     if not open_care_assessment_tab(page, client):
         print(f"    !! could not open Care Assessment for {client.name}")
         return (0, 0, 1)
@@ -1544,6 +1924,12 @@ def download_care_assessments_for_client(
                 failed += 1
                 continue
 
+            # --force-aid gate: skip every row whose assessment_id
+            # isn't the one the user asked us to re-download.
+            if force_aid and aid != force_aid:
+                skipped += 1
+                continue
+
             # SAFETY: skip In-Progress rows. Their action-column icon
             # is a TRASH can, not an eye, and clicking it deletes the
             # assessment. Re-read the row's status from the live DOM
@@ -1576,7 +1962,25 @@ def download_care_assessments_for_client(
             # and the new "<aid>_<N>of<M>" form. If we find an
             # old-style file, rename it to the new convention so
             # the folder ends up consistent.
+            #
+            # `--force-aid` bypasses this check AND deletes any
+            # existing file for this AID first so the re-download
+            # writes cleanly.
             existing = list(client_folder.glob(f"{aid_part}*"))
+            if existing and force_aid and aid == force_aid:
+                for old in existing:
+                    try:
+                        old.unlink()
+                        print(
+                            f"        [force-aid] deleted existing "
+                            f"{old.name!r} to force re-download"
+                        )
+                    except OSError as exc:
+                        print(
+                            f"        [force-aid] could not delete "
+                            f"{old.name!r}: {exc}"
+                        )
+                existing = []
             if existing:
                 old_file = existing[0]
                 if old_file.stem == aid_part and old_file.stem != file_stem:
@@ -2173,6 +2577,15 @@ def main() -> int:
         help="Only process this single ClientID; skips the list walk.",
     )
     parser.add_argument(
+        "--force-aid",
+        default="",
+        metavar="ASSESSMENT_ID",
+        help="Only download this specific assessment_id (e.g. '158'); "
+             "skips every other row AND bypasses the resume-dedupe "
+             "check so an already-saved file is re-downloaded. Use "
+             "with --client-id to force-retry one SSRS assessment.",
+    )
+    parser.add_argument(
         "--list-only",
         action="store_true",
         help="Walk the client list and print every client, then exit. "
@@ -2228,8 +2641,33 @@ def main() -> int:
     # available during login, the client-list walk, and the
     # downloads. It also acts as the status picker when --status
     # wasn't supplied on the CLI.
-    control = _ControlWindow(initial_status=args.status)
-    control.start()
+    #
+    # SKIP the window in single-client debug mode (--client-id or
+    # --force-aid) — the window's close button sets a shutdown
+    # event, and it's easy to accidentally close it mid-run
+    # thinking the run is hung. In debug mode we WANT the run to
+    # complete without any external "stop" signal.
+    debug_mode = bool(args.client_id or args.force_aid)
+    if debug_mode:
+        print("[*] Debug mode (--client-id/--force-aid): skipping control window.")
+
+        class _NoopControl:
+            shutdown_event = threading.Event()
+            start_event = threading.Event()
+            gui_available = False
+            status_choice = args.status or "Inactive"
+
+            def start(self) -> None:
+                self.start_event.set()
+
+            def wait_for_start(self, timeout: float | None = None) -> bool:  # noqa: ARG002
+                return True
+
+        control = _NoopControl()  # type: ignore[assignment]
+        control.start()
+    else:
+        control = _ControlWindow(initial_status=args.status)
+        control.start()
 
     if args.status is None:
         # Give tkinter a beat to spin up its window/`gui_available`.
@@ -2315,6 +2753,7 @@ def main() -> int:
                 s, sk, f = download_care_assessments_for_client(
                     page, client, args.out,
                     shutdown_event=control.shutdown_event,
+                    force_aid=args.force_aid,
                 )
                 total_saved += s
                 total_skipped += sk
