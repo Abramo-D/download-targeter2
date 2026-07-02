@@ -47,6 +47,7 @@ import argparse
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import traceback
@@ -61,6 +62,64 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
+
+
+def _get_version() -> str:
+    """
+    Auto-derive a version string from git history so it bumps every
+    time a commit lands — no manual `__version__` bumping needed.
+
+    Format:
+        v.<commit-count> (<short-sha>)[ +dirty]
+
+    where:
+      * <commit-count> — `git rev-list --count HEAD`, monotonically
+        increases with each commit on the current branch.
+      * <short-sha> — `git rev-parse --short HEAD`, identifies the
+        exact commit.
+      * ` +dirty` — appended iff the working tree has uncommitted
+        changes (staged or unstaged), so a run of not-yet-committed
+        code is obviously distinguishable from a clean commit.
+
+    Falls back to `v.0-dev` when git isn't installed, the repo has
+    no commits, or the file isn't inside a git checkout.
+    """
+    try:
+        script_dir = Path(__file__).resolve().parent
+    except (OSError, NameError):
+        return "v.0-dev"
+
+    def _git(*args: str) -> str:
+        return subprocess.check_output(
+            ("git", *args),
+            cwd=str(script_dir),
+            stderr=subprocess.DEVNULL,
+        ).decode("ascii", errors="replace").strip()
+
+    try:
+        count = _git("rev-list", "--count", "HEAD")
+        sha = _git("rev-parse", "--short", "HEAD")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return "v.0-dev"
+
+    dirty = ""
+    try:
+        # Exit 0 == clean, 1 == dirty. Any other error = treat clean.
+        subprocess.check_call(
+            ["git", "diff-index", "--quiet", "HEAD", "--"],
+            cwd=str(script_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        dirty = " +dirty"
+    except (FileNotFoundError, OSError):
+        pass
+
+    return f"v.{count} ({sha}){dirty}"
+
+
+__version__ = _get_version()
 
 # ─── constants ────────────────────────────────────────────────────────────
 
@@ -2585,7 +2644,7 @@ class _ControlWindow:
             return
 
         self.gui_available = True
-        root.title("Care-plan scraper — control")
+        root.title(f"Care-plan scraper — {__version__}")
         try:
             root.attributes("-topmost", True)
         except Exception:  # noqa: BLE001
@@ -2810,6 +2869,11 @@ def main() -> int:
         description="Mass-download Care Assessment PDFs from Caresmartz360."
     )
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
         "--status",
         choices=["Active", "Inactive", "Both"],
         default=None,
@@ -2912,6 +2976,10 @@ def main() -> int:
         return 2
 
     args.out.mkdir(parents=True, exist_ok=True)
+
+    # Print the version so every log clearly identifies which build
+    # of the scraper generated it. Auto-bumps on every git commit.
+    print(f"[*] download-targeter2 {__version__}")
 
     # Refresh <saved>of<total> counts on existing client folders
     # before we touch the network. Purely local; no-op if the tree
