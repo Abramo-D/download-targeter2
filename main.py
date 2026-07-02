@@ -47,6 +47,8 @@ import argparse
 import os
 import re
 import sys
+import threading
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -644,12 +646,56 @@ def collect_assessment_rows(page: Page) -> list[dict]:
     return rows
 
 
+def _current_paginator_page(page: Page) -> int:
+    """
+    Read the currently-selected inner page number from the custom
+    paginator (the `<div class="index__item selected">` element).
+    Returns -1 when the paginator isn't visible or the label isn't
+    numeric. Used to decide whether we can reuse the current table
+    view instead of doing a full re-navigation.
+    """
+    try:
+        selected = page.locator("div.index__item.selected").first
+        if not selected.count():
+            return -1
+        raw = (selected.inner_text() or "").strip()
+        return int(raw)
+    except (ValueError, TypeError, Exception):  # noqa: BLE001
+        return -1
+
+
 def _navigate_to_inner_page(page: Page, client: Client, target_page_no: int) -> bool:
     """
-    Reset the Care Assessment table to inner page `target_page_no` by
-    re-opening the tab (which always lands on page 1) and clicking the
-    paginator-next N-1 times.
+    Get the Care Assessment table showing inner page `target_page_no`.
+
+    Fast paths (avoid a full page.goto + Care Assessment tab click):
+
+      1. If the table is visible AND the paginator already shows
+         `target_page_no`, return immediately.
+      2. If the table is visible AND we're on an earlier page,
+         click paginator-next until we reach `target_page_no`.
+
+    Slow path (fall-back): re-open the client detail URL, click
+    Care Assessment, then paginate from page 1.
     """
+    trs_visible = page.locator(ASSESSMENT_ROW_SELECTOR).count() > 0
+    current = _current_paginator_page(page) if trs_visible else -1
+
+    if trs_visible and current == target_page_no:
+        return True
+
+    if trs_visible and 0 < current < target_page_no:
+        # Just click next until we arrive.
+        for _ in range(target_page_no - current):
+            if not click_paginator_next(page, ASSESSMENT_ID_CELL_SELECTOR):
+                # Fell short; drop to full re-nav below.
+                break
+            if _current_paginator_page(page) == target_page_no:
+                return True
+        if _current_paginator_page(page) == target_page_no:
+            return True
+
+    # Slow path: full reload of Care Assessment then paginate from 1.
     if not open_care_assessment_tab(page, client):
         return False
     for _ in range(max(0, target_page_no - 1)):
@@ -782,49 +828,108 @@ def _try_legacy_ssrs_export_pdf(
     else:
         print("        [ssrs] L2 OK: PDF option visible in export menu")
 
-    # ── Landmark 3: click PDF and capture the download ──────────
+    # ── Landmark 3: get the PDF and save it ─────────────────────
     save_path = save_dir / f"{file_stem}.pdf"
-    try:
-        with target_page.expect_download(timeout=25_000) as dl_info:
-            pdf_link.click()
-        dl = dl_info.value
-        dl.save_as(str(save_path))
-        print(f"        [ssrs] L3 OK: download captured -> {save_path.name}")
-        return save_path
-    except PlaywrightTimeoutError:
-        pass
 
-    # Fallback: some SSRS installs serve the PDF inline (no
-    # Content-Disposition). Snag the response body directly.
+    # Attempt 3a: many SSRS builds render PDF menu items as real
+    # anchors whose `href` is the direct PDF URL. Grab it and use
+    # the browser's request client so the session cookies come
+    # along. This bypasses onclick JS + `window.open(...)` entirely.
+    pdf_href = ""
     try:
-        with target_page.expect_response(
-            lambda r: (
-                "pdf" in (r.headers.get("content-type", "") or "").lower()
-                or r.url.lower().endswith(".pdf")
-                or "format=pdf" in r.url.lower()
-            ),
-            timeout=25_000,
-        ) as resp_info:
-            try:
-                pdf_link.click()
-            except Exception:  # noqa: BLE001
-                pass
-        resp = resp_info.value
-        body = resp.body()
-        if body[:4] != b"%PDF":
-            print(
-                f"        [ssrs] L3 FAIL: response body isn't a PDF "
-                f"(first bytes: {body[:8]!r})"
+        pdf_href = pdf_link.evaluate(
+            "(el) => el.getAttribute('href') || el.href || ''"
+        ) or ""
+    except Exception:  # noqa: BLE001
+        pdf_href = ""
+    if pdf_href and "javascript:" not in pdf_href.lower():
+        # Resolve relative to the popup URL.
+        try:
+            resolved = pdf_link.evaluate(
+                "(el) => new URL(el.getAttribute('href') || el.href, "
+                "document.baseURI).toString()"
             )
-            _dump_popup_debug(target_page, file_stem, "ssrs_pdf_bad_body")
-            return None
-        save_path.write_bytes(body)
-        print(f"        [ssrs] L3 OK: PDF body captured -> {save_path.name}")
-        return save_path
-    except PlaywrightTimeoutError:
-        print("        [ssrs] L3 FAIL: PDF click didn't trigger a download")
-        _dump_popup_debug(target_page, file_stem, "ssrs_pdf_click_no_download")
-        return None
+        except Exception:  # noqa: BLE001
+            resolved = pdf_href
+        try:
+            api = target_page.context.request
+            response = api.get(resolved)
+            if response.ok:
+                body = response.body()
+                if body[:4] == b"%PDF":
+                    save_path.write_bytes(body)
+                    print(
+                        f"        [ssrs] L3 OK: direct-fetch -> "
+                        f"{save_path.name} ({len(body):,} bytes)"
+                    )
+                    return save_path
+        except Exception as exc:  # noqa: BLE001
+            print(f"        [ssrs] L3 direct-fetch failed: {exc}")
+
+    # Attempt 3b: register a CONTEXT-level response listener that
+    # captures any PDF response (Content-Type or URL/query hints),
+    # THEN click the PDF option. Classic SSRS uses `window.open`
+    # to load the PDF into a new tab, so page-level `expect_*`
+    # calls miss it. Context-level catches all pages.
+    ctx = target_page.context
+    captured: list[Path] = []
+
+    def _on_response(resp) -> None:
+        if captured:
+            return
+        try:
+            url = resp.url.lower()
+            ct = (resp.headers.get("content-type") or "").lower()
+            if (
+                "pdf" not in ct
+                and not url.endswith(".pdf")
+                and "format=pdf" not in url
+            ):
+                return
+            body = resp.body()
+            if not body.startswith(b"%PDF"):
+                return
+            save_path.write_bytes(body)
+            captured.append(save_path)
+        except Exception:  # noqa: BLE001
+            pass
+
+    ctx.on("response", _on_response)
+    try:
+        try:
+            pdf_link.click()
+        except Exception as exc:  # noqa: BLE001
+            print(f"        [ssrs] L3 click raised: {exc}")
+        deadline_ms = 25_000
+        poll_ms = 200
+        elapsed = 0
+        while elapsed < deadline_ms and not captured:
+            target_page.wait_for_timeout(poll_ms)
+            elapsed += poll_ms
+    finally:
+        try:
+            ctx.remove_listener("response", _on_response)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Close any new tabs the PDF click spawned (SSRS opens the
+    # export in a new window) so they don't accumulate.
+    for extra in [p for p in ctx.pages if p is not target_page]:
+        try:
+            extra.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if captured:
+        print(
+            f"        [ssrs] L3 OK: response captured -> "
+            f"{captured[0].name}"
+        )
+        return captured[0]
+
+    print("        [ssrs] L3 FAIL: PDF click didn't produce a PDF response")
+    _dump_popup_debug(target_page, file_stem, "ssrs_pdf_click_no_download")
+    return None
 
 
 def _find_ssrs_toggle(
@@ -1272,7 +1377,10 @@ def _write_status_file(
 
 
 def download_care_assessments_for_client(
-    page: Page, client: Client, out_root: Path
+    page: Page,
+    client: Client,
+    out_root: Path,
+    shutdown_event: threading.Event | None = None,
 ) -> tuple[int, int, int]:
     """Returns (saved, skipped, failed) for this client."""
     if not open_care_assessment_tab(page, client):
@@ -1393,6 +1501,8 @@ def download_care_assessments_for_client(
     saved = skipped = failed = 0
 
     for page_no in sorted(rows_by_page):
+        if shutdown_event is not None and shutdown_event.is_set():
+            break
         rows_on_page = rows_by_page[page_no]
         n_expected = len(rows_on_page)
         print(f"    -- inner page {page_no} ({n_expected} row(s)) --")
@@ -1403,6 +1513,9 @@ def download_care_assessments_for_client(
         # (Angular sometimes resets to page 1, sometimes doesn't —
         # we don't have to care).
         for row_idx in range(n_expected):
+            if shutdown_event is not None and shutdown_event.is_set():
+                print("        (shutdown requested; stopping this client)")
+                break
             if not _navigate_to_inner_page(page, client, page_no):
                 print(f"    !! could not navigate to inner page {page_no}")
                 failed += n_expected - row_idx
@@ -1816,6 +1929,189 @@ def _update_folder_totals_at_startup(out_root: Path) -> None:
         )
 
 
+class _ControlWindow:
+    """
+    Always-on-top tkinter window that combines two roles:
+
+      1. Status picker (Inactive / Active / Both) with a green
+         "Start Scraping" button. Skipped if a status was already
+         supplied on the command line.
+      2. Red "Close and Update Data" button while the scraper is
+         running. Clicking it (or closing the window with the X)
+         sets `shutdown_event`; the main loop checks the flag
+         between rows / clients, stops cleanly, closes the
+         browser, then refreshes every folder name +
+         `_STATUS_*.txt` before exiting.
+
+    Runs on a background daemon thread so the scraper's main loop
+    keeps running. Falls back to `gui_available = False` if
+    tkinter isn't installed or a display can't be opened; in that
+    case the caller should fall through to the terminal prompt.
+    """
+
+    def __init__(self, initial_status: str | None = None) -> None:
+        self.shutdown_event = threading.Event()
+        self.start_event = threading.Event()
+        self.status_choice = initial_status or "Inactive"
+        self.gui_available = False
+        self._initial_status = initial_status
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def wait_for_start(self, timeout: float | None = None) -> bool:
+        """Block until Start (or close) is clicked. Returns True
+        if start_event was set; False if the timeout elapsed."""
+        return self.start_event.wait(timeout=timeout)
+
+    def _run(self) -> None:
+        try:
+            self._run_body()
+        except Exception:  # noqa: BLE001
+            # Print full traceback so the user knows why the window
+            # died, instead of silently disappearing.
+            print("[control-window] tkinter thread crashed:", flush=True)
+            traceback.print_exc()
+            # Release any waiter so main() doesn't hang forever.
+            self.start_event.set()
+
+    def _run_body(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError:
+            # No tkinter available — release any waiter so the
+            # main thread doesn't hang.
+            self.start_event.set()
+            return
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.start_event.set()
+            return
+
+        self.gui_available = True
+        root.title("Care-plan scraper — control")
+        try:
+            root.attributes("-topmost", True)
+        except Exception:  # noqa: BLE001
+            pass
+        root.geometry("400x260+80+80")
+
+        # Widgets built up-front; toggled between "pick status" and
+        # "running" states.
+        picker_frame = tk.Frame(root)
+        running_frame = tk.Frame(root)
+
+        # ── Picker state ──────────────────────────────────────
+        tk.Label(
+            picker_frame,
+            text="Which clients do you want to scrape?",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(pady=(10, 4))
+
+        status_var = tk.StringVar(value=self.status_choice)
+        radio_row = tk.Frame(picker_frame)
+        radio_row.pack(pady=6)
+        for label, val in (
+            ("Inactive", "Inactive"),
+            ("Active", "Active"),
+            ("Both", "Both"),
+        ):
+            tk.Radiobutton(
+                radio_row,
+                text=label,
+                variable=status_var,
+                value=val,
+            ).pack(side="left", padx=10)
+
+        def _enter_running_state() -> None:
+            picker_frame.pack_forget()
+            running_frame.pack(fill="both", expand=True)
+            running_label.config(
+                text=(
+                    f"Scraping {self.status_choice} clients.\n\n"
+                    "Click below to stop cleanly and refresh\n"
+                    "all folder names + status files."
+                )
+            )
+
+        def _on_start() -> None:
+            try:
+                print("[control-window] Start clicked", flush=True)
+                self.status_choice = status_var.get()
+                print(
+                    f"[control-window] status_choice = "
+                    f"{self.status_choice!r}",
+                    flush=True,
+                )
+                self.start_event.set()
+                _enter_running_state()
+                print("[control-window] entered running state", flush=True)
+            except Exception:  # noqa: BLE001
+                print("[control-window] _on_start crashed:", flush=True)
+                traceback.print_exc()
+                # Ensure the main thread still unblocks.
+                self.start_event.set()
+
+        start_btn = tk.Button(
+            picker_frame,
+            text="Start Scraping",
+            command=_on_start,
+            bg="#27ae60",
+            fg="white",
+            padx=16,
+            pady=8,
+            font=("Segoe UI", 10, "bold"),
+        )
+        start_btn.pack(pady=10)
+
+        # ── Running state ─────────────────────────────────────
+        running_label = tk.Label(
+            running_frame,
+            text="",
+            padx=10,
+            pady=10,
+            justify="center",
+        )
+        running_label.pack()
+
+        def _on_close() -> None:
+            self.shutdown_event.set()
+            # If the user closed BEFORE clicking Start, still
+            # release the waiter so main() can exit cleanly.
+            self.start_event.set()
+            try:
+                root.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+        close_btn = tk.Button(
+            running_frame,
+            text="Close and Update Data",
+            command=_on_close,
+            bg="#c0392b",
+            fg="white",
+            padx=16,
+            pady=8,
+            font=("Segoe UI", 10, "bold"),
+        )
+        close_btn.pack(pady=10)
+
+        # Show the appropriate frame at startup.
+        if self._initial_status:
+            self.start_event.set()
+            _enter_running_state()
+        else:
+            picker_frame.pack(fill="both", expand=True)
+
+        root.protocol("WM_DELETE_WINDOW", _on_close)
+        try:
+            root.mainloop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _prompt_status_choice() -> str:
     """
     Ask the user which status bucket to scrape. Returns one of
@@ -1928,11 +2224,36 @@ def main() -> int:
     print("[*] Updating existing folder totals...")
     _update_folder_totals_at_startup(args.out)
 
-    # If --status was omitted, prompt interactively (or fall back
-    # to Inactive when stdin isn't a TTY, e.g. under a scheduler).
+    # Show the always-on-top control window RIGHT NOW so it's
+    # available during login, the client-list walk, and the
+    # downloads. It also acts as the status picker when --status
+    # wasn't supplied on the CLI.
+    control = _ControlWindow(initial_status=args.status)
+    control.start()
+
     if args.status is None:
-        args.status = _prompt_status_choice()
-        print(f"[*] Status filter: {args.status}")
+        # Give tkinter a beat to spin up its window/`gui_available`.
+        control.wait_for_start(timeout=1.5)
+        if control.gui_available:
+            print(
+                "[*] Waiting for status choice in the control "
+                "window (click 'Start Scraping')...",
+                flush=True,
+            )
+            control.wait_for_start()
+            print(
+                f"[*] Start received (status={control.status_choice!r}, "
+                f"shutdown={control.shutdown_event.is_set()})",
+                flush=True,
+            )
+            if control.shutdown_event.is_set() and not control.start_event.is_set():
+                print("[*] Control window closed without starting; exiting.")
+                return 0
+            args.status = control.status_choice
+        else:
+            # No GUI available — fall back to terminal prompt.
+            args.status = _prompt_status_choice()
+        print(f"[*] Status filter: {args.status}", flush=True)
 
     # Inactive first when both are requested — that's the bigger
     # bucket and the one the user wants prioritised, so it shouldn't
@@ -1978,13 +2299,23 @@ def main() -> int:
                 return 0
 
             print("[*] Starting downloads...")
+
             for client in clients:
+                if control.shutdown_event.is_set():
+                    print(
+                        "[*] Close-and-update-data requested; "
+                        "stopping cleanly."
+                    )
+                    break
                 total_clients += 1
                 print(
                     f"[client {total_clients}] {client.status}: "
                     f"{client.name} ({client.client_id})"
                 )
-                s, sk, f = download_care_assessments_for_client(page, client, args.out)
+                s, sk, f = download_care_assessments_for_client(
+                    page, client, args.out,
+                    shutdown_event=control.shutdown_event,
+                )
                 total_saved += s
                 total_skipped += sk
                 total_failed += f
@@ -1998,6 +2329,12 @@ def main() -> int:
         finally:
             context.close()
             browser.close()
+
+    # Refresh every folder name + status file so their contents
+    # reflect the final on-disk state (including anything saved
+    # during THIS run, plus any manually-dropped files).
+    print("[*] Updating folder totals + status files with final state...")
+    _update_folder_totals_at_startup(args.out)
 
     print()
     print(f"[+] Clients processed : {total_clients}")
